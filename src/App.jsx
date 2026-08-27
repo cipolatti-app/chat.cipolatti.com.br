@@ -17,7 +17,7 @@ import { activity, chartData, contacts, departments, users } from "./data";
 const BRAND_NAME = "CIPOLATTI";
 const BRAND_SUBTITLE = "Central de Atendimento Corporativo";
 const BRAND_ICON = `${import.meta.env.BASE_URL}cipolatti-icon.png`;
-const FRONTEND_BUILD_VERSION = "2026.08.21.11";
+const FRONTEND_BUILD_VERSION = "2026.08.27.1";
 const DEFAULT_API_TIMEOUT_MS = 15000;
 const LOGIN_API_TIMEOUT_MS = 15000;
 const appLifecycle = { hiddenAt: 0, resumedAt: Date.now() };
@@ -270,6 +270,7 @@ async function apiRequest(path, options = {}) {
   const target = path.startsWith("/api/") ? (apiBase ? `${apiBase}${path.slice(4)}` : path) : path;
   const isFormData = options.body instanceof FormData;
   const timeoutMs = Number(options.timeoutMs || DEFAULT_API_TIMEOUT_MS);
+  const allowDuringResume = Boolean(options.allowDuringResume);
   const startedAt = Date.now();
   const startedHidden = document.hidden;
   const controller = new AbortController();
@@ -281,7 +282,7 @@ async function apiRequest(path, options = {}) {
   let response;
   let payload;
   try {
-    const { timeoutMs: _timeoutMs, signal: _signal, ...fetchOptions } = options;
+    const { timeoutMs: _timeoutMs, signal: _signal, allowDuringResume: _allowDuringResume, ...fetchOptions } = options;
     response = await fetch(target, {
       ...fetchOptions,
       credentials: "include",
@@ -291,7 +292,7 @@ async function apiRequest(path, options = {}) {
     payload = await response.json().catch(() => ({}));
   } catch (error) {
     if (error?.name === "AbortError" || controller.signal.aborted) {
-      if (startedHidden || isLikelySuspendedRequest(startedAt)) {
+      if (!allowDuringResume && (startedHidden || isLikelySuspendedRequest(startedAt))) {
         const suspendedError = new Error("Requisição pausada enquanto o aplicativo estava em segundo plano.");
         suspendedError.code = "APP_SUSPENDED";
         suspendedError.path = path;
@@ -1578,6 +1579,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   const audioChunksRef = useRef([]);
   const audioStartRef = useRef(0);
   const collaboratorsErrorNotifiedRef = useRef(false);
+  const selectedIdRef = useRef(null);
   const fileDraft = fileDrafts[activeFileIndex] || null;
   const draftStorageKey = currentUser?.id ? `cipolatti_chat_drafts_${currentUser.id}` : "";
   const isAdmin = currentUser.role === "Administrador";
@@ -1625,6 +1627,10 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   const activeSearchMessageId = activeSearchResult?.id || "";
 
   useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  useEffect(() => {
     const syncMobileChatState = () => {
       const mobileViewport = window.matchMedia?.("(max-width: 768px)").matches;
       document.body.classList.toggle("cipolatti-mobile-chat-active", Boolean(internal && mobileChat && mobileViewport));
@@ -1646,6 +1652,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     let heartbeatTimer = 0;
     let closed = false;
     let lastActivitySent = 0;
+    let lastConnectedAt = 0;
     const mergePresenceRows = (rows = []) => {
       setPresenceByUserId((currentMap) => {
         const next = { ...currentMap };
@@ -1670,6 +1677,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       window.clearInterval(heartbeatTimer);
       socket = new WebSocket(websocketApiUrl("/api/presence"));
       socket.onopen = () => {
+        lastConnectedAt = Date.now();
         markSelfOnline();
         sendPresence("presence:activity");
         window.clearInterval(heartbeatTimer);
@@ -1689,10 +1697,17 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     };
     const ensurePresenceConnected = () => {
       if (document.hidden) return;
+      const shouldForceReconnect = appLifecycle.hiddenAt > lastConnectedAt && Date.now() - appLifecycle.hiddenAt > 60_000;
       if (socket?.readyState === WebSocket.OPEN) {
+        if (shouldForceReconnect) {
+          socket.onclose = null;
+          socket.close();
+          connect();
+          return;
+        }
         markSelfOnline();
         sendPresence("presence:activity");
-        apiRequest("/api/presence").then(mergePresenceRows).catch(() => {});
+        apiRequest("/api/presence", { allowDuringResume: true, timeoutMs: 10000 }).then(mergePresenceRows).catch(() => {});
         return;
       }
       window.clearTimeout(reconnectTimer);
@@ -1706,7 +1721,9 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     document.addEventListener("visibilitychange", sendActivity);
     document.addEventListener("visibilitychange", ensurePresenceConnected);
     window.addEventListener("pageshow", ensurePresenceConnected);
+    window.addEventListener("focus", ensurePresenceConnected);
     window.addEventListener("online", ensurePresenceConnected);
+    window.addEventListener("cipolatti-app-resume", ensurePresenceConnected);
     return () => {
       closed = true;
       window.clearTimeout(reconnectTimer);
@@ -1716,7 +1733,9 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       document.removeEventListener("visibilitychange", sendActivity);
       document.removeEventListener("visibilitychange", ensurePresenceConnected);
       window.removeEventListener("pageshow", ensurePresenceConnected);
+      window.removeEventListener("focus", ensurePresenceConnected);
       window.removeEventListener("online", ensurePresenceConnected);
+      window.removeEventListener("cipolatti-app-resume", ensurePresenceConnected);
       socket?.close();
     };
   }, [currentUser?.id, internal]);
@@ -1876,26 +1895,48 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     let active = true;
     let refreshTimer = 0;
     let refreshInFlight = false;
+    let pendingRefresh = null;
     const scheduleRefresh = (delay = 3000) => {
       window.clearTimeout(refreshTimer);
       if (!active) return;
       refreshTimer = window.setTimeout(refresh, delay);
     };
-    const refresh = async () => {
-      if (!active || refreshInFlight) return;
-      if (document.hidden) {
+    const refresh = async (options = {}) => {
+      const forceResume = Boolean(options.allowDuringResume || options.reason === "resume" || options.reason === "push");
+      const targetConversationId = options.conversationId || sessionStorage.getItem("cipolatti-open-conversation-id") || selectedIdRef.current || "";
+      if (!active) return;
+      if (refreshInFlight) {
+        pendingRefresh = { ...options, conversationId: targetConversationId };
+        return;
+      }
+      if (document.hidden && !forceResume) {
         scheduleRefresh(3000);
         return;
       }
       refreshInFlight = true;
       try {
-        const conversationRows = await apiRequest("/api/internal/conversations");
+        console.info("CIPOLATTI resume sync: conversations refresh", options.reason || "poll");
+        const requestOptions = forceResume ? { allowDuringResume: true, timeoutMs: 20000 } : {};
+        const conversationRows = await apiRequest("/api/internal/conversations", requestOptions);
         if (!active) return;
-        const mapped = conversationRows.map((conversation) => mapInternalConversation(conversation, currentUser));
+        let mapped = conversationRows.map((conversation) => mapInternalConversation(conversation, currentUser));
+        if (targetConversationId) {
+          try {
+            const detail = await apiRequest(`/api/internal/conversations/${targetConversationId}`, requestOptions);
+            const mappedDetail = mapInternalConversation(detail, currentUser);
+            mapped = mapped.some((conversation) => conversation.id === mappedDetail.id)
+              ? mapped.map((conversation) => conversation.id === mappedDetail.id ? mappedDetail : conversation)
+              : [mappedDetail, ...mapped];
+            console.info("CIPOLATTI resume sync: active conversation refreshed", { conversationId: targetConversationId });
+          } catch (error) {
+            if (forceResume) console.warn("CIPOLATTI resume sync: active conversation refresh failed", { status: error.status || "", code: error.code || "" });
+          }
+        }
         setConversations(mapped);
         const scoped = groupOnly ? mapped.filter((item) => item.type === "group") : mapped;
         setSelectedId((value) => value && scoped.some((item) => item.id === value) ? value : null);
-        apiRequest("/api/collaborators", { timeoutMs: 10000 })
+        window.dispatchEvent(new CustomEvent("kalion-unread-refresh"));
+        apiRequest("/api/collaborators", { timeoutMs: 10000, allowDuringResume: forceResume })
           .then((directoryRows) => {
             if (!active) return;
             collaboratorsErrorNotifiedRef.current = false;
@@ -1911,19 +1952,28 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
         if (active) setToast(error.message);
       } finally {
         refreshInFlight = false;
+        if (pendingRefresh) {
+          const next = pendingRefresh;
+          pendingRefresh = null;
+          window.clearTimeout(refreshTimer);
+          refresh(next);
+          return;
+        }
         scheduleRefresh(3000);
       }
     };
-    const resumeRefresh = () => {
+    const resumeRefresh = (event) => {
       if (document.hidden) return;
       window.clearTimeout(refreshTimer);
-      refresh();
+      const detail = event?.detail || {};
+      refresh({ reason: event?.type === "cipolatti-app-resume" ? detail.reason || "resume" : "resume", allowDuringResume: true, conversationId: detail.conversationId || "" });
     };
     refresh();
     document.addEventListener("visibilitychange", resumeRefresh);
     window.addEventListener("pageshow", resumeRefresh);
     window.addEventListener("focus", resumeRefresh);
     window.addEventListener("online", resumeRefresh);
+    window.addEventListener("cipolatti-app-resume", resumeRefresh);
     return () => {
       active = false;
       window.clearTimeout(refreshTimer);
@@ -1931,6 +1981,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       window.removeEventListener("pageshow", resumeRefresh);
       window.removeEventListener("focus", resumeRefresh);
       window.removeEventListener("online", resumeRefresh);
+      window.removeEventListener("cipolatti-app-resume", resumeRefresh);
     };
   }, [internal, groupOnly, currentUser.id]);
 
@@ -2968,7 +3019,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     let found = (current.messages || []).some((message) => message.id === item.messageId);
     if (!found && internal) {
       try {
-        const result = await apiRequest(`/api/internal/conversations/${item.conversationId || current.id}/messages/around/${item.messageId}`);
+        const result = await apiRequest(`/api/internal/conversations/${item.conversationId || current.id}/messages/around/${item.messageId}`, { allowDuringResume: true, timeoutMs: 20000 });
         if (Array.isArray(result.messages)) {
           setConversations((rows) => rows.map((conversation) => {
             if (conversation.id !== (item.conversationId || current.id)) return conversation;
@@ -5419,6 +5470,7 @@ function PresenceKeeper({ currentUser }) {
     let heartbeatTimer = 0;
     let closed = false;
     let lastActivitySent = 0;
+    let lastConnectedAt = 0;
     const sendPresence = (type) => {
       if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type, at: Date.now() }));
     };
@@ -5434,6 +5486,7 @@ function PresenceKeeper({ currentUser }) {
       window.clearInterval(heartbeatTimer);
       socket = new WebSocket(websocketApiUrl("/api/presence"));
       socket.onopen = () => {
+        lastConnectedAt = Date.now();
         sendPresence("presence:activity");
         window.clearInterval(heartbeatTimer);
         heartbeatTimer = window.setInterval(() => sendPresence("presence:heartbeat"), 30_000);
@@ -5446,7 +5499,14 @@ function PresenceKeeper({ currentUser }) {
     };
     const ensurePresenceConnected = () => {
       if (document.hidden) return;
+      const shouldForceReconnect = appLifecycle.hiddenAt > lastConnectedAt && Date.now() - appLifecycle.hiddenAt > 60_000;
       if (socket?.readyState === WebSocket.OPEN) {
+        if (shouldForceReconnect) {
+          socket.onclose = null;
+          socket.close();
+          connect();
+          return;
+        }
         sendPresence("presence:activity");
         return;
       }
@@ -5459,7 +5519,9 @@ function PresenceKeeper({ currentUser }) {
     document.addEventListener("visibilitychange", sendActivity);
     document.addEventListener("visibilitychange", ensurePresenceConnected);
     window.addEventListener("pageshow", ensurePresenceConnected);
+    window.addEventListener("focus", ensurePresenceConnected);
     window.addEventListener("online", ensurePresenceConnected);
+    window.addEventListener("cipolatti-app-resume", ensurePresenceConnected);
     return () => {
       closed = true;
       window.clearTimeout(reconnectTimer);
@@ -5468,7 +5530,9 @@ function PresenceKeeper({ currentUser }) {
       document.removeEventListener("visibilitychange", sendActivity);
       document.removeEventListener("visibilitychange", ensurePresenceConnected);
       window.removeEventListener("pageshow", ensurePresenceConnected);
+      window.removeEventListener("focus", ensurePresenceConnected);
       window.removeEventListener("online", ensurePresenceConnected);
+      window.removeEventListener("cipolatti-app-resume", ensurePresenceConnected);
       socket?.close();
     };
   }, [currentUser?.id]);
@@ -5486,6 +5550,9 @@ function App() {
   const [serviceWorkerUpdate, setServiceWorkerUpdate] = useState(null);
   const [pushActivationPrompt, setPushActivationPrompt] = useState(null);
   const authRefreshPromiseRef = useRef(null);
+  const resumePromiseRef = useRef(null);
+  const resumeTimerRef = useRef(0);
+  const pendingResumeDetailRef = useRef(null);
   useEffect(() => {
     console.info(`CIPOLATTI frontend build: ${FRONTEND_BUILD_VERSION}`);
   }, []);
@@ -5507,35 +5574,17 @@ function App() {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [serviceWorkerUpdate]);
-  const openConversationFromPush = (detail = {}) => {
-    const conversationId = detail.conversationId || "";
-    if (!conversationId) return;
-    if (detail.messageId) {
-      sessionStorage.setItem("cipolatti-open-message-id", detail.messageId);
-      sessionStorage.setItem("cipolatti-open-message-target", JSON.stringify({ conversationId, messageId: detail.messageId }));
-    }
-    sessionStorage.setItem("cipolatti-open-conversation-id", conversationId);
-    setPage(detail.groupId || detail.isGroup || detail.group ? "grupos" : "conversas");
-    window.dispatchEvent(new CustomEvent("cipolatti-open-conversation", { detail: { id: conversationId, messageId: detail.messageId || "" } }));
-    if (detail.notificationId) apiRequest(`/api/notifications/${detail.notificationId}/read`, { method: "POST", body: "{}" }).catch(() => {});
-    else apiRequest(`/api/internal/conversations/${conversationId}/read`, { method: "POST", body: "{}" }).catch(() => {});
-  };
-  useEffect(() => {
-    if (!("serviceWorker" in navigator)) return undefined;
-    const onMessage = (event) => {
-      if (event.data?.type === "cipolatti-open-push") openConversationFromPush(event.data);
-    };
-    navigator.serviceWorker.addEventListener("message", onMessage);
-    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
-  }, []);
   const handleSessionExpired = (error) => {
     setAuthNotice(authNoticeFromError(error));
     setCurrentUser(null);
     setPage("conversas");
   };
-  const refreshCurrentSession = () => {
+  const refreshCurrentSession = (options = {}) => {
     if (authRefreshPromiseRef.current) return authRefreshPromiseRef.current;
-    authRefreshPromiseRef.current = apiRequest("/api/auth/me").then((result) => {
+    authRefreshPromiseRef.current = apiRequest("/api/auth/me", {
+      allowDuringResume: Boolean(options.allowDuringResume),
+      timeoutMs: options.timeoutMs || DEFAULT_API_TIMEOUT_MS,
+    }).then((result) => {
       setAuthNotice("");
       setCurrentUser(result.user);
       return result.user;
@@ -5547,7 +5596,83 @@ function App() {
     });
     return authRefreshPromiseRef.current;
   };
+  const resumeApp = (reason = "resume", detail = {}) => {
+    if (!currentUser?.id) return Promise.resolve(null);
+    pendingResumeDetailRef.current = { ...(pendingResumeDetailRef.current || {}), ...detail, reason };
+    if (resumePromiseRef.current) return resumePromiseRef.current;
+    resumePromiseRef.current = (async () => {
+      const resumeDetail = pendingResumeDetailRef.current || { reason };
+      pendingResumeDetailRef.current = null;
+      console.info("CIPOLATTI resume sync: foreground", { reason: resumeDetail.reason || reason, online: navigator.onLine });
+      await refreshCurrentSession({ allowDuringResume: true, timeoutMs: 20000 });
+      window.dispatchEvent(new CustomEvent("cipolatti-app-resume", { detail: resumeDetail }));
+      window.dispatchEvent(new CustomEvent("kalion-unread-refresh"));
+      return resumeDetail;
+    })().catch((error) => {
+      if (error?.status === 401 || error?.status === 403) return null;
+      console.warn("CIPOLATTI resume sync: failed", { status: error?.status || "", code: error?.code || "" });
+      return null;
+    }).finally(() => {
+      resumePromiseRef.current = null;
+      if (pendingResumeDetailRef.current && !document.hidden) {
+        const next = pendingResumeDetailRef.current;
+        pendingResumeDetailRef.current = null;
+        window.setTimeout(() => resumeApp(next.reason || "resume", next), 250);
+      }
+    });
+    return resumePromiseRef.current;
+  };
+  const scheduleResumeApp = (reason = "resume", detail = {}) => {
+    if (document.hidden || !currentUser?.id) return;
+    pendingResumeDetailRef.current = { ...(pendingResumeDetailRef.current || {}), ...detail, reason };
+    window.clearTimeout(resumeTimerRef.current);
+    resumeTimerRef.current = window.setTimeout(() => resumeApp(reason, pendingResumeDetailRef.current || detail), 350);
+  };
+  const openConversationFromPush = (detail = {}) => {
+    const conversationId = detail.conversationId || "";
+    if (!conversationId) return;
+    console.info("CIPOLATTI resume sync: push notification opened", { conversationId, hasMessageId: Boolean(detail.messageId), hasNotificationId: Boolean(detail.notificationId) });
+    if (detail.messageId) {
+      sessionStorage.setItem("cipolatti-open-message-id", detail.messageId);
+      sessionStorage.setItem("cipolatti-open-message-target", JSON.stringify({ conversationId, messageId: detail.messageId }));
+    }
+    sessionStorage.setItem("cipolatti-open-conversation-id", conversationId);
+    setPage(detail.groupId || detail.isGroup || detail.group ? "grupos" : "conversas");
+    resumeApp("push-notification", { conversationId, messageId: detail.messageId || "", notificationId: detail.notificationId || "", group: detail.groupId || detail.isGroup || detail.group })
+      .finally(() => window.setTimeout(() => {
+        window.dispatchEvent(new CustomEvent("cipolatti-open-conversation", { detail: { id: conversationId, messageId: detail.messageId || "" } }));
+      }, 80));
+    if (detail.notificationId) apiRequest(`/api/notifications/${detail.notificationId}/read`, { method: "POST", body: "{}", allowDuringResume: true }).catch(() => {});
+    else apiRequest(`/api/internal/conversations/${conversationId}/read`, { method: "POST", body: "{}", allowDuringResume: true }).catch(() => {});
+  };
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return undefined;
+    const onMessage = (event) => {
+      if (event.data?.type === "cipolatti-open-push") openConversationFromPush(event.data);
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, [currentUser?.id]);
   useEffect(()=>{refreshCurrentSession().catch(()=>{}).finally(()=>setAuthReady(true));},[]);
+  useEffect(() => {
+    if (!currentUser?.id) return undefined;
+    const onVisible = () => {
+      if (!document.hidden) scheduleResumeApp("visibilitychange");
+      else console.info("CIPOLATTI resume sync: app background");
+    };
+    const onResume = (event) => scheduleResumeApp(event.type);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("pageshow", onResume);
+    window.addEventListener("focus", onResume);
+    window.addEventListener("online", onResume);
+    return () => {
+      window.clearTimeout(resumeTimerRef.current);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("pageshow", onResume);
+      window.removeEventListener("focus", onResume);
+      window.removeEventListener("online", onResume);
+    };
+  }, [currentUser?.id]);
   useEffect(() => {
     if(!currentUser)return;
     const savedTheme = currentUser.preferences?.theme || localStorage.getItem(`kalion-theme-${currentUser.email}`) || "light";
