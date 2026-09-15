@@ -1,10 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Activity, AlertTriangle, Archive, ArrowLeftRight, BarChart3, Bell, Building2, CalendarDays, CheckCircle2,
   ChevronDown, ChevronLeft, ChevronRight, CircleGauge, Clock3, Contact, Download, FileText,
   Eye, EyeOff, Filter, Headphones, History, Image, KeyRound, LockKeyhole, LogOut, Menu,
-  MessageCircle, MessageSquare, Mic, MonitorUp, MoreHorizontal, Paperclip, Pencil, Phone,
+  MessageCircle, MessageSquare, Mic, MonitorUp, MoreHorizontal, Paperclip, Pause, Pencil, Phone, Play,
   Plus, RefreshCw, Save, Search, Send, Settings, ShieldCheck, SlidersHorizontal,
   Smile, StopCircle, Tags, Trash2, UserPlus, Users, Video, Webhook, X, Zap
 } from "lucide-react";
@@ -17,7 +17,7 @@ import { activity, chartData, contacts, departments, users } from "./data";
 const BRAND_NAME = "CIPOLATTI";
 const BRAND_SUBTITLE = "Central de Atendimento Corporativo";
 const BRAND_ICON = `${import.meta.env.BASE_URL}cipolatti-icon.png`;
-const FRONTEND_BUILD_VERSION = "2026.08.27.1";
+const FRONTEND_BUILD_VERSION = "2026.09.14.1";
 const DEFAULT_API_TIMEOUT_MS = 15000;
 const LOGIN_API_TIMEOUT_MS = 15000;
 const appLifecycle = { hiddenAt: 0, resumedAt: Date.now() };
@@ -418,6 +418,7 @@ async function webPushDiagnostics() {
     subscription: Boolean(subscription),
     endpoint: subscription?.endpoint || "",
     vibrationSupported: "vibrate" in navigator,
+    badgingSupported: typeof navigator.setAppBadge === "function" || typeof navigator.clearAppBadge === "function",
     displayMode: window.matchMedia?.("(display-mode: standalone)")?.matches || window.navigator.standalone ? "PWA instalada/standalone" : "Navegador",
   };
 }
@@ -426,6 +427,19 @@ const pushPermissionLabelFromValue = (value) => value === "granted" ? "Permitida
   : value === "denied" ? "Bloqueada"
   : value === "default" ? "Não solicitada"
   : "Indisponível";
+
+async function updateAppBadge(totalUnread = 0) {
+  const count = Math.max(0, Number(totalUnread) || 0);
+  try {
+    if (count > 0 && typeof navigator.setAppBadge === "function") {
+      await navigator.setAppBadge(count);
+    } else if (count <= 0 && typeof navigator.clearAppBadge === "function") {
+      await navigator.clearAppBadge();
+    }
+  } catch {
+    // Badging API is progressive; unsupported launchers/browsers must not affect the chat.
+  }
+}
 
 async function sendWebPushTestNotification() {
   const subscription = await ensureWebPushSubscription();
@@ -1131,6 +1145,7 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
   const notifiedMessagesRef = useRef(new Set());
   const notifiedNotificationsRef = useRef(new Set());
   const pendingMessageAlertsRef = useRef(new Map());
+  const localAlertStartedAtRef = useRef(Date.now());
   const lastNotificationSoundRef = useRef(0);
   const audioUnlockedRef = useRef(false);
   const nativeNotificationFallbackRef = useRef(true);
@@ -1217,6 +1232,10 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
     return () => { document.title = "Chat | Cipolatti"; };
   }, [currentUser.preferences, unreadCounts.messagesUnread, unreadCounts.notificationsUnread]);
   useEffect(() => {
+    const totalUnread = Number(unreadCounts.messagesUnread || 0) + Number(unreadCounts.notificationsUnread || 0);
+    updateAppBadge(totalUnread);
+  }, [unreadCounts.messagesUnread, unreadCounts.notificationsUnread]);
+  useEffect(() => {
     if (!messageBanner) return undefined;
     const onFocus = () => setMessageBanner((current) => current ? { ...current, visible: true } : current);
     window.addEventListener("focus", onFocus);
@@ -1248,8 +1267,10 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
   useEffect(() => {
     if (!currentUser?.id) return undefined;
     let active = true;
+    localAlertStartedAtRef.current = Date.now();
     notificationSeededRef.current = false;
     notifiedMessagesRef.current = new Set();
+    pendingMessageAlertsRef.current = new Map();
     const pollMessages = async () => {
       try {
         const conversations = await apiRequest("/api/internal/conversations");
@@ -1265,6 +1286,14 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
           (conversation.messages || []).forEach((message) => {
             const messageId = message.id || `${conversation.id}-${message.createdAt || ""}-${message.senderId || ""}-${message.text || ""}`;
             if (message.type === "system" || message.senderId === currentUser.id) return;
+            const messageCreatedAt = new Date(message.createdAt || 0).getTime();
+            const isFreshForLocalAlert = Number.isFinite(messageCreatedAt)
+              && messageCreatedAt >= localAlertStartedAtRef.current - 5000;
+            if (!notificationSeededRef.current) {
+              notifiedMessagesRef.current.add(messageId);
+              return;
+            }
+            if (!isFreshForLocalAlert) return;
             const alertInfo = {
               id: messageId,
               conversationId: conversation.id,
@@ -1273,13 +1302,15 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
               sender: message.sender || conversation.title || "CIPOLATTI",
               title: isGroup ? `Nova mensagem em ${conversation.title || "Grupo interno"}` : `Nova mensagem de ${message.sender || conversation.title || "CIPOLATTI"}`,
               preview: messageNotificationPreview(message, preferences.showContent),
+              messageCreatedAt: message.createdAt || "",
+              notificationSource: "frontend-local",
             };
             nextPending.set(messageId, alertInfo);
             if (notifiedMessagesRef.current.has(messageId)) return;
             notifiedMessagesRef.current.add(messageId);
-            if (!notificationSeededRef.current) return;
             if (!preferences.enabled || preferences.doNotDisturb) return;
             if (activeConversationId === conversation.id && isFocused) return;
+            console.info("CIPOLATTI notification", { notificationSource: "frontend-local", messageId, conversationId: conversation.id, messageCreatedAt: message.createdAt || "", notificationCreatedAt: new Date().toISOString(), userId: currentUser.id, reason: "poll-new-message" });
             setMessageBanner({ ...alertInfo, visible: true });
             if (!nativeNotificationFallbackRef.current || !preferences.windows || !browserNotificationsAvailable() || Notification.permission !== "granted") return;
             const titleText = isGroup
@@ -1321,6 +1352,7 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
       if (!preferences.enabled || !preferences.persistent || preferences.doNotDisturb) return;
       const pending = [...pendingMessageAlertsRef.current.values()][0];
       if (!pending) return;
+      console.info("CIPOLATTI notification", { notificationSource: "frontend-local", messageId: pending.id, conversationId: pending.conversationId, messageCreatedAt: pending.messageCreatedAt || "", notificationCreatedAt: new Date().toISOString(), userId: currentUser.id, reason: "repeat-current-session-message" });
       setMessageBanner({ ...pending, visible: true });
       if (preferences.sound && audioUnlockedRef.current && Date.now() - lastNotificationSoundRef.current > 45000) {
         lastNotificationSoundRef.current = Date.now();
@@ -1538,6 +1570,8 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   const [pendingLatestCount, setPendingLatestCount] = useState(0);
   const [audioDraft, setAudioDraft] = useState(null);
   const [recordingAudio, setRecordingAudio] = useState(false);
+  const [recordingElapsedSeconds, setRecordingElapsedSeconds] = useState(0);
+  const [audioSending, setAudioSending] = useState(false);
   const [fileDrafts, setFileDrafts] = useState([]);
   const [activeFileIndex, setActiveFileIndex] = useState(0);
   const [attachmentMessage, setAttachmentMessage] = useState("");
@@ -1562,11 +1596,12 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       || fileSending
       || audioDraft
       || recordingAudio
+      || audioSending
     );
     return () => {
       if (window.__cipolattiHasPendingChatWork) delete window.__cipolattiHasPendingChatWork;
     };
-  }, [text, attachmentMessage, fileDrafts.length, messageSending, fileSending, audioDraft, recordingAudio]);
+  }, [text, attachmentMessage, fileDrafts.length, messageSending, fileSending, audioDraft, recordingAudio, audioSending]);
   const fileInputRef = useRef(null);
   const conversationSearchRef = useRef(null);
   const emojiPickerRef = useRef(null);
@@ -1574,10 +1609,13 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   const previousMessageCountRef = useRef(0);
   const followLatestRef = useRef(true);
   const draftsRef = useRef({});
+  const draftPersistTimerRef = useRef(0);
+  const readConversationKeyRef = useRef("");
   const replyRef = useRef({});
   const recorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const audioStartRef = useRef(0);
+  const audioDiscardRef = useRef(false);
   const collaboratorsErrorNotifiedRef = useRef(false);
   const selectedIdRef = useRef(null);
   const fileDraft = fileDrafts[activeFileIndex] || null;
@@ -1625,6 +1663,14 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   }, [conversationSearch, current?.id, visibleMessages]);
   const activeSearchResult = searchResults[Math.min(activeSearchIndex, Math.max(0, searchResults.length - 1))] || null;
   const activeSearchMessageId = activeSearchResult?.id || "";
+
+  useEffect(() => {
+    if (!recordingAudio) return undefined;
+    const updateElapsed = () => setRecordingElapsedSeconds(Math.max(0, Math.floor((Date.now() - audioStartRef.current) / 1000)));
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 250);
+    return () => window.clearInterval(timer);
+  }, [recordingAudio]);
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
@@ -1822,14 +1868,26 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     replyRef.current = replyByConversationId;
   }, [replyByConversationId]);
 
-  const persistConversationDrafts = (drafts) => {
-    draftsRef.current = drafts;
+  const writeConversationDrafts = (drafts) => {
     if (!draftStorageKey) return;
     try {
       if (Object.keys(drafts).length) localStorage.setItem(draftStorageKey, JSON.stringify(drafts));
       else localStorage.removeItem(draftStorageKey);
     } catch {}
   };
+  const persistConversationDrafts = (drafts, options = {}) => {
+    draftsRef.current = drafts;
+    window.clearTimeout(draftPersistTimerRef.current);
+    if (options.immediate) {
+      writeConversationDrafts(drafts);
+      return;
+    }
+    draftPersistTimerRef.current = window.setTimeout(() => writeConversationDrafts(draftsRef.current), 450);
+  };
+  useEffect(() => () => {
+    window.clearTimeout(draftPersistTimerRef.current);
+    writeConversationDrafts(draftsRef.current);
+  }, [draftStorageKey]);
 
   const setConversationDraft = (conversationId, value) => {
     if (!conversationId) return;
@@ -1849,7 +1907,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       if (!currentDrafts[conversationId]) return currentDrafts;
       const next = { ...currentDrafts };
       delete next[conversationId];
-      persistConversationDrafts(next);
+      persistConversationDrafts(next, { immediate: true });
       return next;
     });
   };
@@ -1986,7 +2044,74 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   }, [internal, groupOnly, currentUser.id]);
 
   useEffect(() => {
-    if (!internal || !current?.id || current.source !== "internal-api" || !current.unread) return;
+    if (!internal || typeof EventSource === "undefined") return undefined;
+    let source = null;
+    let reconnectTimer = 0;
+    let closed = false;
+    const connect = () => {
+      if (closed || document.hidden) return;
+      source = new EventSource(apiUrl("/api/internal/events"), { withCredentials: true });
+      source.addEventListener("internal-conversation", (event) => {
+        try {
+          const payload = JSON.parse(event.data || "{}");
+          if (!payload.conversation?.id) return;
+          const mapped = mapInternalConversation(payload.conversation, currentUser);
+          setConversations((items) => {
+            const next = [mapped, ...items.filter((item) => item.id !== mapped.id)];
+            return next.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+          });
+          const activeConversationId = selectedIdRef.current || "";
+          if (payload.timing && (activeConversationId === mapped.id || payload.changedMessageIds?.length)) {
+            console.info("CIPOLATTI realtime message", {
+              conversationId: mapped.id,
+              changedMessageIds: payload.changedMessageIds || [],
+              requestStartedAt: payload.timing.requestStartedAt || "",
+              backendPersistedAt: payload.timing.backendPersistedAt || "",
+              broadcastAt: payload.timing.broadcastAt || "",
+              clientReceivedAt: new Date().toISOString(),
+            });
+          }
+          window.dispatchEvent(new CustomEvent("kalion-unread-refresh"));
+        } catch (error) {
+          console.warn("CIPOLATTI realtime message: invalid event", { error: error.message || String(error) });
+        }
+      });
+      source.onerror = () => {
+        source?.close();
+        if (!closed) reconnectTimer = window.setTimeout(connect, 5000);
+      };
+    };
+    const resume = () => {
+      if (document.hidden) {
+        source?.close();
+        return;
+      }
+      if (!source || source.readyState === EventSource.CLOSED) {
+        window.clearTimeout(reconnectTimer);
+        connect();
+      }
+    };
+    connect();
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("focus", resume);
+    window.addEventListener("online", resume);
+    window.addEventListener("cipolatti-app-resume", resume);
+    return () => {
+      closed = true;
+      window.clearTimeout(reconnectTimer);
+      source?.close();
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("focus", resume);
+      window.removeEventListener("online", resume);
+      window.removeEventListener("cipolatti-app-resume", resume);
+    };
+  }, [internal, currentUser.id]);
+
+  useEffect(() => {
+    if (!internal || !current?.id || current.source !== "internal-api" || document.hidden) return;
+    const readKey = `${current.id}:${current.updatedAt || ""}:${current.messages?.length || 0}`;
+    if (readConversationKeyRef.current === readKey) return;
+    readConversationKeyRef.current = readKey;
     let active = true;
     apiRequest(`/api/internal/conversations/${current.id}/read`, { method: "POST", body: "{}" })
       .then((result) => {
@@ -1998,7 +2123,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       })
       .catch(() => {});
     return () => { active = false; };
-  }, [internal, current?.id, current?.unread, currentUser.id]);
+  }, [internal, current?.id, current?.updatedAt, current?.messages?.length, currentUser.id]);
 
   useEffect(() => {
     if (internal) return undefined;
@@ -2320,14 +2445,27 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
       const recorder = new MediaRecorder(media, { mimeType });
       audioChunksRef.current = [];
+      audioDiscardRef.current = false;
       audioStartRef.current = Date.now();
+      setRecordingElapsedSeconds(0);
       recorder.ondataavailable = (event) => event.data.size && audioChunksRef.current.push(event.data);
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
         media.getTracks().forEach((track) => track.stop());
-        const durationSeconds = Math.max(1, Math.round((Date.now() - audioStartRef.current) / 1000));
-        const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
-        if (blob.size) setAudioDraft({ blob, url: URL.createObjectURL(blob), durationSeconds });
+        const measuredSeconds = Math.max(1, Math.round((Date.now() - audioStartRef.current) / 1000));
+        setRecordingElapsedSeconds(measuredSeconds);
         setRecordingAudio(false);
+        if (audioDiscardRef.current) {
+          audioDiscardRef.current = false;
+          audioChunksRef.current = [];
+          return;
+        }
+        const blobType = recorder.mimeType || mimeType || "audio/webm";
+        const blob = new Blob(audioChunksRef.current, { type: blobType });
+        audioChunksRef.current = [];
+        if (!blob.size) return setToast("Não foi possível gerar a prévia do áudio.");
+        const url = URL.createObjectURL(blob);
+        const durationSeconds = await resolveAudioBlobDuration(url, measuredSeconds);
+        setAudioDraft({ blob, url, durationSeconds, recordedSeconds: measuredSeconds, loadingDuration: false });
       };
       recorderRef.current = recorder;
       recorder.start();
@@ -2340,18 +2478,24 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     }
   };
   const cancelAudioDraft = () => {
-    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    if (recorderRef.current?.state === "recording") {
+      audioDiscardRef.current = true;
+      recorderRef.current.stop();
+    }
     recorderRef.current = null;
     if (audioDraft?.url) URL.revokeObjectURL(audioDraft.url);
     setAudioDraft(null);
     setRecordingAudio(false);
+    setAudioSending(false);
+    setRecordingElapsedSeconds(0);
   };
   const sendAudioDraft = async () => {
-    if (!audioDraft || !current?.id) return;
+    if (!audioDraft || !current?.id || audioSending) return;
     if (!currentCanSendMessages) {
       setToast("Somente administradores podem enviar mensagens neste momento.");
       return;
     }
+    setAudioSending(true);
     try {
       const body = new FormData();
       body.append("file", audioDraft.blob, `audio-${Date.now()}.webm`);
@@ -2368,6 +2512,8 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       cancelAudioDraft();
     } catch (error) {
       setToast(error.message);
+    } finally {
+      setAudioSending(false);
     }
   };
   const clearFileDrafts = () => {
@@ -3074,6 +3220,33 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       moveSearchResult(event.shiftKey ? -1 : 1);
     }
   };
+  const renderedMessageNodes = useMemo(() => visibleMessages.map((message, index) => {
+    const messageId = message.id || `${message.time || ""}-${index}`;
+    const previousMessage = visibleMessages[index - 1];
+    const currentDateKey = messageDateGroupKey(message, index);
+    const previousDateKey = previousMessage ? messageDateGroupKey(previousMessage, index - 1) : "";
+    const showDateDivider = currentDateKey !== previousDateKey;
+    const matched = searchResults.some((item) => item.id === messageId);
+    const activeMatch = activeSearchMessageId === messageId;
+    const isOutOfOfficeMessage = message.messageType === "out_of_office" || message.outOfOffice;
+    const renderedMessage = message.type === "system"
+      ? <div className={`system-message ${isOutOfOfficeMessage ? "system-message-out-of-office" : ""} ${matched ? "search-matched" : ""} ${activeMatch ? "search-active" : ""} ${locatedMessageId === messageId ? "message-located" : ""}`} data-message-id={messageId}>{isOutOfOfficeMessage && <strong>Resposta automática - Fora do escritório</strong>}<HighlightedText text={message.text} query={conversationSearch} /><time>{message.time}</time></div>
+      : <MessageBubble {...message} id={messageId} showSender={current?.type === "group" || (current?.participantUsers?.length || 0) > 2} searchQuery={conversationSearch} searchMatched={matched} searchActive={activeMatch} located={locatedMessageId === messageId} currentUserId={currentUser.id} onReply={() => selectReply(message)} onForward={internal ? () => setForwarding(message) : null} onReact={internal ? (emoji) => reactToMessage(message, emoji) : null} onEdit={canEditMessage(message) ? () => startEditingMessage(message) : null} onJump={jumpToMessage} onRetry={message.status === "failed" && message.retryDraft ? () => retryAttachmentUpload(message) : null} />;
+    return <React.Fragment key={messageId}>
+      {showDateDivider && <div className="date-divider"><span>{formatMessageDateLabel(message)}</span></div>}
+      {renderedMessage}
+    </React.Fragment>;
+  }), [
+    visibleMessages,
+    searchResults,
+    activeSearchMessageId,
+    locatedMessageId,
+    conversationSearch,
+    current?.type,
+    current?.participantUsers?.length,
+    currentUser.id,
+    internal,
+  ]);
   const draftPreview = (conversationId) => {
     const value = draftsByConversationId[conversationId]?.text || "";
     const clean = value.replace(/\s+/g, " ").trim();
@@ -3160,23 +3333,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
         </div>}
         <div className="messages" ref={messagesRef} data-testid="messages-scroll" onScroll={() => { const nearBottom = isNearMessagesBottom(); followLatestRef.current = nearBottom; setShowJumpLatest(!nearBottom); if (nearBottom) setPendingLatestCount(0); }}>
           {dragActive && <div className="drop-overlay"><Paperclip size={22}/><span>Solte o arquivo para anexar</span></div>}
-          {visibleMessages.map((message, index) => {
-            const messageId = message.id || `${message.time || ""}-${index}`;
-            const previousMessage = visibleMessages[index - 1];
-            const currentDateKey = messageDateGroupKey(message, index);
-            const previousDateKey = previousMessage ? messageDateGroupKey(previousMessage, index - 1) : "";
-            const showDateDivider = currentDateKey !== previousDateKey;
-            const matched = searchResults.some((item) => item.id === messageId);
-            const activeMatch = activeSearchMessageId === messageId;
-            const isOutOfOfficeMessage = message.messageType === "out_of_office" || message.outOfOffice;
-            const renderedMessage = message.type === "system"
-              ? <div className={`system-message ${isOutOfOfficeMessage ? "system-message-out-of-office" : ""} ${matched ? "search-matched" : ""} ${activeMatch ? "search-active" : ""} ${locatedMessageId === messageId ? "message-located" : ""}`} data-message-id={messageId}>{isOutOfOfficeMessage && <strong>Resposta automática - Fora do escritório</strong>}<HighlightedText text={message.text} query={conversationSearch} /><time>{message.time}</time></div>
-              : <MessageBubble {...message} id={messageId} showSender={current?.type === "group" || (current?.participantUsers?.length || 0) > 2} searchQuery={conversationSearch} searchMatched={matched} searchActive={activeMatch} located={locatedMessageId === messageId} currentUserId={currentUser.id} onReply={() => selectReply(message)} onForward={internal ? () => setForwarding(message) : null} onReact={internal ? (emoji) => reactToMessage(message, emoji) : null} onEdit={canEditMessage(message) ? () => startEditingMessage(message) : null} onJump={jumpToMessage} onRetry={message.status === "failed" && message.retryDraft ? () => retryAttachmentUpload(message) : null} />;
-            return <React.Fragment key={messageId}>
-              {showDateDivider && <div className="date-divider"><span>{formatMessageDateLabel(message)}</span></div>}
-              {renderedMessage}
-            </React.Fragment>;
-          })}
+          {renderedMessageNodes}
         </div>
           <div className="composer-wrap">
             {showJumpLatest && <button type="button" className="jump-latest" onClick={() => scrollMessagesToBottom("smooth")}>↓ {pendingLatestCount > 0 ? `${pendingLatestCount} nova${pendingLatestCount === 1 ? "" : "s"} mensagem${pendingLatestCount === 1 ? "" : "s"}` : "Novas mensagens"}</button>}
@@ -3188,15 +3345,15 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
             {internal && <input ref={fileInputRef} type="file" multiple hidden onChange={selectFileDraft} />}
             <textarea ref={composerTextRef} disabled={current.ended || groupSendBlocked || Boolean(fileDraft)} value={text} onPaste={handlePaste} onChange={(event) => editingMessage ? setText(event.target.value) : updateComposerText(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape" && editingMessage) { event.preventDefault(); cancelEditingMessage(); } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder={current.ended ? "Conversa encerrada. Inicie uma nova conversa." : groupSendBlocked ? "Somente administradores podem enviar mensagens." : editingMessage ? "Edite sua mensagem..." : fileDraft ? "Envie ou cancele os anexos selecionados." : "Digite sua mensagem..."} />
             <div className="composer-tools">
-              <span className="composer-left-tools"><button title="Emoji" aria-label="Abrir emojis" disabled={current.ended || groupSendBlocked || Boolean(fileDraft)} onClick={() => setEmojiOpen((value) => !value)}><Smile /></button><button title="Anexar" disabled={current.ended || groupSendBlocked || !internal || Boolean(fileDraft)} onClick={() => fileInputRef.current?.click()}><Paperclip /></button>{internal&&<button className={recordingAudio ? "recording-tool" : ""} title={recordingAudio ? "Parar gravação" : "Gravar áudio"} disabled={current.ended || groupSendBlocked || Boolean(audioDraft) || Boolean(fileDraft)} onClick={() => recordingAudio ? recorderRef.current?.stop() : startAudioRecording()}><Mic /></button>}</span>
+              <span className="composer-left-tools"><button title="Emoji" aria-label="Abrir emojis" disabled={current.ended || groupSendBlocked || Boolean(fileDraft) || audioSending} onClick={() => setEmojiOpen((value) => !value)}><Smile /></button><button title="Anexar" disabled={current.ended || groupSendBlocked || !internal || Boolean(fileDraft) || audioSending} onClick={() => fileInputRef.current?.click()}><Paperclip /></button>{internal&&<button className={recordingAudio ? "recording-tool" : ""} title={recordingAudio ? "Parar gravação" : "Gravar áudio"} disabled={current.ended || groupSendBlocked || Boolean(audioDraft) || Boolean(fileDraft) || audioSending} onClick={() => recordingAudio ? recorderRef.current?.stop() : startAudioRecording()}><Mic /></button>}</span>
               {editingMessage && <button className="secondary-button compact-action" type="button" onClick={cancelEditingMessage}>Cancelar</button>}
               <button className="send-button" disabled={current.ended || groupSendBlocked || fileSending || (!text.trim() && !fileDraft?.file)} onClick={sendMessage} title={editingMessage ? "Salvar edição" : "Enviar"}>{editingMessage ? <Save /> : <Send />}</button>
             </div>
             {emojiOpen && <EmojiPickerPanel pickerRef={emojiPickerRef} recentEmojis={recentEmojis} onSelect={insertEmoji} onClose={() => setEmojiOpen(false)} />}
           </div>
           {internal && fileDrafts.length > 0 && <AttachmentModal drafts={fileDrafts} activeIndex={activeFileIndex} sending={fileSending} totalProgress={fileProgress} progressLabel={fileProgressLabel} message={attachmentMessage} onMessageChange={setAttachmentMessage} onActiveChange={setActiveFileIndex} onRemove={removeFileDraft} onAddMore={addMoreFiles} onCancel={cancelFileDraft} onSend={sendFileDraft} onDrop={(files) => createFileDraft(files, "drop")} />}
-          {internal && audioDraft && <div className="audio-draft"><Mic size={16}/><audio controls src={audioDraft.url}/><span>{audioDraft.durationSeconds}s</span><button className="secondary-button" onClick={cancelAudioDraft}>Cancelar</button><button className="primary-button" onClick={sendAudioDraft}><Send size={15}/> Enviar áudio</button></div>}
-          {internal && recordingAudio && <div className="audio-draft recording"><Mic size={16}/><span>Gravando áudio...</span><button className="danger-button" onClick={() => recorderRef.current?.stop()}>Parar</button></div>}
+          {internal && audioDraft && <div className={`audio-draft audio-draft-preview ${audioSending ? "sending" : ""}`}><ChatAudioPlayer audio={audioDraft} src={audioDraft.url} isOwnMessage showDownload={false}/><span className="audio-draft-duration">Duração: {formatAudioTime(audioDraft.durationSeconds || audioDraft.recordedSeconds || 0)}</span><div className="audio-draft-actions"><button className="secondary-button" disabled={audioSending} onClick={cancelAudioDraft}>Cancelar</button><button className="primary-button" disabled={audioSending} onClick={sendAudioDraft}><Send size={15}/> {audioSending ? "Enviando..." : "Enviar áudio"}</button></div></div>}
+          {internal && recordingAudio && <div className="audio-draft recording"><span className="recording-status"><i/> Gravando... {formatRecordingTime(recordingElapsedSeconds)}</span><button className="danger-button" onClick={() => recorderRef.current?.stop()}>Parar</button></div>}
           <small className="typing">{current.ended ? "Esta conversa foi encerrada." : `Você está respondendo como ${currentUser.name} - ${currentUser.role}`}</small>
         </div>
       </main>
@@ -3562,6 +3719,7 @@ function EmojiPickerPanel({ pickerRef, recentEmojis = [], onSelect, onClose }) {
 
 function AttachmentModal({ drafts, activeIndex, sending, totalProgress, progressLabel, message, onMessageChange, onActiveChange, onRemove, onAddMore, onCancel, onSend, onDrop }) {
   const [dragging, setDragging] = useState(false);
+  const messageRef = useRef(null);
   const active = drafts[activeIndex] || drafts[0];
   const totalSize = drafts.reduce((sum, draft) => sum + draft.file.size, 0);
   const canSend = drafts.some((draft) => draft.status !== "sent" && draft.status !== "sending");
@@ -3573,6 +3731,14 @@ function AttachmentModal({ drafts, activeIndex, sending, totalProgress, progress
       document.documentElement.classList.remove("attachment-modal-open");
     };
   }, []);
+  useEffect(() => {
+    const textarea = messageRef.current;
+    if (!textarea) return;
+    const maxHeight = window.matchMedia?.("(max-width: 760px)")?.matches ? 150 : 156;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [message, activeIndex, drafts.length]);
   const preview = () => {
     if (!active) return null;
     const url = active.previewUrl;
@@ -3615,7 +3781,7 @@ function AttachmentModal({ drafts, activeIndex, sending, totalProgress, progress
         </button>)}
         <button type="button" className="attachment-thumb add" disabled={sending || drafts.length >= MAX_ATTACHMENT_BATCH_FILES} onClick={onAddMore}><Plus size={19}/><span>Adicionar</span></button>
       </div>
-      <textarea className="attachment-modal-message" value={message || ""} disabled={sending} maxLength={2000} onChange={(event) => onMessageChange(event.target.value.slice(0, 2000))} placeholder="Mensagem" aria-label="Mensagem do anexo" />
+      <textarea ref={messageRef} className="attachment-modal-message" value={message || ""} disabled={sending} maxLength={2000} onChange={(event) => onMessageChange(event.target.value.slice(0, 2000))} placeholder="Mensagem" aria-label="Mensagem do anexo" />
       {sending && <div className="upload-progress attachment-modal-progress"><i style={{ width: `${Math.max(totalProgress, 4)}%` }} /><span>{Math.max(totalProgress, 0)}%</span></div>}
     </div>
   </Modal>;
@@ -3686,12 +3852,301 @@ function AlbumAttachment({ files = [], caption = "" }) {
   </div>;
 }
 
+function getInitialContextMenuStyle(margin = 10) {
+  return {
+    top: margin,
+    left: margin,
+    visibility: "hidden",
+    width: "max-content",
+    maxWidth: `calc(100vw - ${margin * 2}px)`,
+  };
+}
+
+function logContextMenuDiagnostic(details) {
+  try {
+    if (window.localStorage?.getItem("CIPOLATTI_DEBUG_MESSAGE_MENU") !== "1") return;
+    console.info("[message-actions-menu]", details);
+  } catch {
+    // Debug logging is intentionally optional.
+  }
+}
+
+function positionContextMenu(anchorElement, menuElement, { kind = "menu", margin = 10, messageDirection = "incoming", messageType = "message", bubbleElement = null } = {}) {
+  if (!anchorElement || typeof window === "undefined") return { top: margin, left: margin };
+  const anchor = anchorElement.getBoundingClientRect();
+  const bubble = bubbleElement?.getBoundingClientRect?.();
+  const visualViewport = window.visualViewport;
+  const viewportLeft = visualViewport?.offsetLeft || 0;
+  const viewportTop = visualViewport?.offsetTop || 0;
+  const viewportWidth = visualViewport?.width || window.innerWidth || document.documentElement.clientWidth || 360;
+  const viewportHeight = visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 740;
+  const safeLeft = viewportLeft + margin;
+  const safeTop = viewportTop + margin;
+  const safeRight = viewportLeft + viewportWidth - margin;
+  const safeBottom = viewportTop + viewportHeight - margin;
+  const fallbackWidth = kind === "reaction" ? 248 : 190;
+  const fallbackHeight = kind === "reaction" ? 48 : 152;
+  const measuredRect = menuElement?.getBoundingClientRect?.();
+  const measuredWidth = Math.ceil(measuredRect?.width || menuElement?.offsetWidth || fallbackWidth);
+  const measuredHeight = Math.ceil(measuredRect?.height || menuElement?.offsetHeight || fallbackHeight);
+  const width = Math.min(Math.max(measuredWidth, kind === "reaction" ? 224 : 176), Math.max(120, viewportWidth - margin * 2));
+  const height = Math.min(Math.max(measuredHeight, kind === "reaction" ? 44 : 112), Math.max(80, viewportHeight - margin * 2));
+  const fits = (value) => value >= safeLeft && value + width <= safeRight;
+  const receivedBubbleStart = bubble ? Math.max(bubble.left, safeLeft) : anchor.left;
+  const sentBubbleEnd = bubble ? Math.min(bubble.right, safeRight) : anchor.right;
+  const incomingCandidates = [
+    anchor.right + 6,
+    anchor.left,
+    receivedBubbleStart,
+    anchor.left - width - 6,
+  ];
+  const outgoingCandidates = [
+    anchor.left - width - 6,
+    anchor.right - width,
+    sentBubbleEnd - width,
+    anchor.left,
+  ];
+  const neutralCandidates = safeRight - anchor.right >= anchor.left - safeLeft
+    ? [anchor.right + 6, anchor.left, anchor.left - width - 6]
+    : [anchor.left - width - 6, anchor.right - width, anchor.left];
+  const preferredCandidates = messageDirection === "outgoing"
+    ? outgoingCandidates
+    : messageDirection === "incoming"
+      ? incomingCandidates
+      : neutralCandidates;
+  let left = preferredCandidates.find(fits);
+  if (typeof left !== "number") left = preferredCandidates[0] ?? anchor.left;
+  const spaceBelow = safeBottom - anchor.bottom;
+  const spaceAbove = anchor.top - safeTop;
+  let top;
+  if (spaceBelow >= height || spaceBelow >= spaceAbove) top = anchor.bottom + 6;
+  else top = anchor.top - height - 6;
+  left = Math.min(Math.max(left, safeLeft), safeRight - width);
+  top = Math.min(Math.max(top, safeTop), safeBottom - height);
+  return {
+    top: Math.round(top),
+    left: Math.round(left),
+    width: Math.round(width),
+    maxHeight: Math.round(Math.max(80, safeBottom - Math.max(top, safeTop))),
+    visibility: "visible",
+  };
+}
+
+function formatAudioTime(value = 0) {
+  if (!Number.isFinite(value) || value < 0) return "0:00";
+  const totalSeconds = Math.floor(value);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function formatRecordingTime(value = 0) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value) || 0));
+  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function resolveAudioBlobDuration(url, fallbackSeconds = 0) {
+  return new Promise((resolve) => {
+    const fallback = Math.max(1, Math.round(Number(fallbackSeconds) || 1));
+    const probe = document.createElement("audio");
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      probe.removeAttribute("src");
+      probe.load();
+      resolve(Math.max(1, Math.round(Number.isFinite(value) && value > 0 ? value : fallback)));
+    };
+    const readDuration = () => {
+      if (Number.isFinite(probe.duration) && probe.duration > 0) done(probe.duration);
+    };
+    const handleInfinity = () => {
+      if (probe.duration !== Infinity) return readDuration();
+      const onTimeUpdate = () => {
+        probe.removeEventListener("timeupdate", onTimeUpdate);
+        readDuration();
+      };
+      probe.addEventListener("timeupdate", onTimeUpdate);
+      try {
+        probe.currentTime = 1e7;
+      } catch {
+        done(fallback);
+      }
+    };
+    probe.preload = "metadata";
+    probe.addEventListener("loadedmetadata", handleInfinity);
+    probe.addEventListener("durationchange", readDuration);
+    probe.addEventListener("error", () => done(fallback), { once: true });
+    window.setTimeout(() => done(fallback), 2500);
+    probe.src = url;
+  });
+}
+
+function ChatAudioPlayer({ audio, src, isOwnMessage = false, showDownload = true }) {
+  const audioRef = useRef(null);
+  const menuButtonRef = useRef(null);
+  const menuRef = useRef(null);
+  const playerRef = useRef(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [duration, setDuration] = useState(Number(audio?.durationSeconds) || 0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuStyle, setMenuStyle] = useState({ top: 0, left: 0, visibility: "hidden" });
+  const direction = isOwnMessage ? "outgoing" : "incoming";
+  const downloadName = audio?.originalName || audio?.name || "audio-chat-cipolatti.webm";
+  const progress = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+
+  const closeMenu = () => setMenuOpen(false);
+  const updateMenuPosition = () => {
+    const position = positionContextMenu(menuButtonRef.current, menuRef.current, {
+      kind: "menu",
+      messageDirection: direction,
+      messageType: "audio-player",
+      bubbleElement: playerRef.current,
+    });
+    setMenuStyle(position);
+  };
+  const openMenu = () => {
+    if (menuOpen) return closeMenu();
+    setMenuStyle(getInitialContextMenuStyle());
+    setMenuOpen(true);
+  };
+  const togglePlayback = async () => {
+    const element = audioRef.current;
+    if (!element) return;
+    if (element.paused) {
+      try {
+        await element.play();
+      } catch {
+        setIsPlaying(false);
+      }
+    } else {
+      element.pause();
+    }
+  };
+  const changePlaybackRate = (rate) => {
+    const element = audioRef.current;
+    if (element) element.playbackRate = rate;
+    setPlaybackRate(rate);
+    closeMenu();
+  };
+  const changeProgress = (event) => {
+    const element = audioRef.current;
+    const nextTime = Number(event.target.value);
+    if (!element || !Number.isFinite(nextTime)) return;
+    element.currentTime = nextTime;
+    setCurrentTime(nextTime);
+  };
+
+  useEffect(() => {
+    const element = audioRef.current;
+    if (!element) return undefined;
+    const syncMetadata = () => {
+      if (Number.isFinite(element.duration)) setDuration(element.duration);
+    };
+    const syncTime = () => setCurrentTime(element.currentTime || 0);
+    const syncPlay = () => setIsPlaying(true);
+    const syncPause = () => setIsPlaying(false);
+    const syncEnd = () => {
+      element.currentTime = 0;
+      setIsPlaying(false);
+      setCurrentTime(0);
+    };
+    element.playbackRate = playbackRate;
+    element.addEventListener("loadedmetadata", syncMetadata);
+    element.addEventListener("durationchange", syncMetadata);
+    element.addEventListener("timeupdate", syncTime);
+    element.addEventListener("play", syncPlay);
+    element.addEventListener("pause", syncPause);
+    element.addEventListener("ended", syncEnd);
+    syncMetadata();
+    return () => {
+      element.removeEventListener("loadedmetadata", syncMetadata);
+      element.removeEventListener("durationchange", syncMetadata);
+      element.removeEventListener("timeupdate", syncTime);
+      element.removeEventListener("play", syncPlay);
+      element.removeEventListener("pause", syncPause);
+      element.removeEventListener("ended", syncEnd);
+    };
+  }, [src, playbackRate]);
+
+  useLayoutEffect(() => {
+    if (!menuOpen) return undefined;
+    const frame = window.requestAnimationFrame(updateMenuPosition);
+    return () => window.cancelAnimationFrame(frame);
+  }, [menuOpen, direction]);
+
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+    const closeOutside = (event) => {
+      if (menuButtonRef.current?.contains(event.target) || menuRef.current?.contains(event.target)) return;
+      closeMenu();
+    };
+    const closeOnEsc = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeMenu();
+    };
+    document.addEventListener("mousedown", closeOutside);
+    document.addEventListener("touchstart", closeOutside);
+    document.addEventListener("keydown", closeOnEsc);
+    document.addEventListener("scroll", closeMenu, true);
+    window.addEventListener("resize", closeMenu);
+    window.addEventListener("orientationchange", closeMenu);
+    window.visualViewport?.addEventListener?.("resize", closeMenu);
+    window.visualViewport?.addEventListener?.("scroll", closeMenu);
+    return () => {
+      document.removeEventListener("mousedown", closeOutside);
+      document.removeEventListener("touchstart", closeOutside);
+      document.removeEventListener("keydown", closeOnEsc);
+      document.removeEventListener("scroll", closeMenu, true);
+      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("orientationchange", closeMenu);
+      window.visualViewport?.removeEventListener?.("resize", closeMenu);
+      window.visualViewport?.removeEventListener?.("scroll", closeMenu);
+    };
+  }, [menuOpen]);
+
+  const menuPortal = menuOpen ? createPortal(
+    <div className={`audio-player-menu message-actions-portal ${isOwnMessage ? "own" : "received"}`} ref={menuRef} role="menu" style={menuStyle}>
+      <strong>Velocidade</strong>
+      {[1, 1.5, 2].map((rate) => (
+        <button key={rate} type="button" role="menuitemradio" aria-checked={playbackRate === rate} className={playbackRate === rate ? "active" : ""} onClick={() => changePlaybackRate(rate)}>
+          {rate}x
+        </button>
+      ))}
+      {showDownload && <a role="menuitem" href={src} target="_blank" rel="noreferrer" download={downloadName}>
+        <Download size={14} /> Baixar áudio
+      </a>}
+    </div>, document.body
+  ) : null;
+
+  return <div ref={playerRef} className={`chat-audio-player ${isOwnMessage ? "own" : "received"}`}>
+    <audio ref={audioRef} preload="metadata" src={src} />
+    <button type="button" className="chat-audio-play" onClick={togglePlayback} aria-label={isPlaying ? "Pausar áudio" : "Reproduzir áudio"}>
+      {isPlaying ? <Pause size={16} /> : <Play size={16} />}
+    </button>
+    <div className="chat-audio-track">
+      <input type="range" min="0" max={duration || 0} step="0.01" value={Math.min(currentTime, duration || currentTime || 0)} onChange={changeProgress} aria-label="Progresso do áudio" style={{ "--audio-progress": `${progress}%` }} />
+      <div className="chat-audio-time"><span>{formatAudioTime(currentTime)}</span><span>{duration ? formatAudioTime(duration) : formatAudioTime(Number(audio?.durationSeconds) || 0)}</span></div>
+    </div>
+    <button ref={menuButtonRef} type="button" className="chat-audio-more" onClick={openMenu} aria-label="Mais opções do áudio" aria-expanded={menuOpen}>
+      <MoreHorizontal size={18} />
+    </button>
+    {menuPortal}
+  </div>;
+}
+
 function MessageBubble({ id, side, sender, senderId, role, text, time, status, errors = [], type = "message", audio, file, albumFiles = [], replyTo, forwardedFrom, reactions = [], readDetails = null, editedAt = null, searchQuery = "", searchMatched = false, searchActive = false, located = false, showSender = true, currentUserId, onReply, onForward, onReact, onEdit, onJump, onRetry }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [reactionOpen, setReactionOpen] = useState(false);
   const [portalStyle, setPortalStyle] = useState({ top: 0, left: 0 });
   const triggerRef = useRef(null);
   const portalRef = useRef(null);
+  const bubbleRef = useRef(null);
   const longPressRef = useRef(null);
   const effectiveStatus = status || (side === "out" ? "sent" : "received");
   const isOwnMessage = senderId && currentUserId ? senderId === currentUserId : side === "out";
@@ -3737,40 +4192,52 @@ function MessageBubble({ id, side, sender, senderId, role, text, time, status, e
     setMenuOpen(false);
     setReactionOpen(false);
   };
+  const messageDirection = isOwnMessage ? "outgoing" : "incoming";
   const calculatePortalPosition = (kind = "menu") => {
-    const trigger = triggerRef.current;
-    if (!trigger) return { top: 0, left: 0 };
-    const rect = trigger.getBoundingClientRect();
-    const viewport = window.visualViewport || { width: window.innerWidth, height: window.innerHeight, offsetLeft: 0, offsetTop: 0 };
-    const viewportLeft = viewport.offsetLeft || 0;
-    const viewportTop = viewport.offsetTop || 0;
-    const viewportWidth = viewport.width || window.innerWidth;
-    const viewportHeight = viewport.height || window.innerHeight;
-    const height = kind === "reaction" ? 48 : (onEdit ? 146 : 112);
-    const margin = 8;
-    const width = Math.min(kind === "reaction" ? 238 : 176, viewportWidth - margin * 2);
-    const rightSpace = viewportLeft + viewportWidth - rect.right - margin;
-    const leftSpace = rect.left - viewportLeft - margin;
-    let left;
-    if (rightSpace >= width || rightSpace >= leftSpace) left = rect.right + margin;
-    else left = rect.left - width - margin;
-    left = Math.max(viewportLeft + margin, Math.min(left, viewportLeft + viewportWidth - width - margin));
-    let top = rect.top + rect.height / 2 - 18;
-    if (top + height > viewportTop + viewportHeight - margin) top = viewportTop + viewportHeight - height - margin;
-    top = Math.max(viewportTop + margin, top);
-    return { top: Math.round(top), left: Math.round(left), minWidth: width };
+    const position = positionContextMenu(triggerRef.current, portalRef.current, { kind, messageDirection, messageType: type, bubbleElement: bubbleRef.current });
+    const anchorRect = triggerRef.current?.getBoundingClientRect?.();
+    const menuRect = portalRef.current?.getBoundingClientRect?.();
+    const visualViewport = window.visualViewport;
+    logContextMenuDiagnostic({
+      messageDirection,
+      messageType: type,
+      kind,
+      anchorLeft: Math.round(anchorRect?.left ?? 0),
+      anchorRight: Math.round(anchorRect?.right ?? 0),
+      anchorTop: Math.round(anchorRect?.top ?? 0),
+      anchorBottom: Math.round(anchorRect?.bottom ?? 0),
+      anchorWidth: Math.round(anchorRect?.width ?? 0),
+      menuWidth: Math.round(menuRect?.width ?? position.width ?? 0),
+      menuHeight: Math.round(menuRect?.height ?? 0),
+      viewportWidth: Math.round(visualViewport?.width || window.innerWidth || 0),
+      viewportHeight: Math.round(visualViewport?.height || window.innerHeight || 0),
+      viewportOffsetLeft: Math.round(visualViewport?.offsetLeft || 0),
+      viewportOffsetTop: Math.round(visualViewport?.offsetTop || 0),
+      computedLeft: position.left,
+      computedTop: position.top,
+    });
+    return position;
+  };
+  const updatePortalPosition = (kind = menuOpen ? "menu" : "reaction") => {
+    setPortalStyle(calculatePortalPosition(kind));
   };
   const openMenu = () => {
     setReactionOpen(false);
     if (menuOpen) return setMenuOpen(false);
-    setPortalStyle(calculatePortalPosition("menu"));
+    setPortalStyle(getInitialContextMenuStyle());
     setMenuOpen(true);
   };
   const openReactions = () => {
     setMenuOpen(false);
-    setPortalStyle(calculatePortalPosition("reaction"));
+    setPortalStyle(getInitialContextMenuStyle());
     setReactionOpen(true);
   };
+  useLayoutEffect(() => {
+    if (!menuOpen && !reactionOpen) return undefined;
+    const kind = menuOpen ? "menu" : "reaction";
+    const frame = window.requestAnimationFrame(() => updatePortalPosition(kind));
+    return () => window.cancelAnimationFrame(frame);
+  }, [menuOpen, reactionOpen, onEdit]);
   useEffect(() => {
     if (!menuOpen && !reactionOpen) return undefined;
     const closeOutside = (event) => {
@@ -3789,12 +4256,18 @@ function MessageBubble({ id, side, sender, senderId, role, text, time, status, e
     document.addEventListener("keydown", closeOnEsc);
     document.addEventListener("scroll", closeOnLayoutChange, true);
     window.addEventListener("resize", closeOnLayoutChange);
+    window.addEventListener("orientationchange", closeOnLayoutChange);
+    window.visualViewport?.addEventListener?.("resize", closeOnLayoutChange);
+    window.visualViewport?.addEventListener?.("scroll", closeOnLayoutChange);
     return () => {
       document.removeEventListener("mousedown", closeOutside);
       document.removeEventListener("touchstart", closeOutside);
       document.removeEventListener("keydown", closeOnEsc);
       document.removeEventListener("scroll", closeOnLayoutChange, true);
       window.removeEventListener("resize", closeOnLayoutChange);
+      window.removeEventListener("orientationchange", closeOnLayoutChange);
+      window.visualViewport?.removeEventListener?.("resize", closeOnLayoutChange);
+      window.visualViewport?.removeEventListener?.("scroll", closeOnLayoutChange);
     };
   }, [menuOpen, reactionOpen]);
   useEffect(() => closeActions, [id]);
@@ -3806,7 +4279,7 @@ function MessageBubble({ id, side, sender, senderId, role, text, time, status, e
     if (!availableActions) return;
     window.clearTimeout(longPressRef.current);
     longPressRef.current = window.setTimeout(() => {
-      setPortalStyle(calculatePortalPosition("menu"));
+      setPortalStyle(getInitialContextMenuStyle());
       setMenuOpen(true);
     }, 460);
   };
@@ -3826,7 +4299,7 @@ function MessageBubble({ id, side, sender, senderId, role, text, time, status, e
   ) : null;
   return <div className={`message-row ${side} message-status-${effectiveStatus} ${searchMatched ? "search-matched" : ""} ${searchActive ? "search-active" : ""} ${located ? "message-located" : ""}`} data-message-id={id || ""}>
     {showSender && <div className="message-sender">{sender}{role ? ` - ${role}` : ""}</div>}
-    <div className={`message-bubble message-bubble-${type}`} onTouchStart={startLongPress} onTouchEnd={cancelLongPress} onTouchMove={cancelLongPress} onTouchCancel={cancelLongPress}>
+    <div ref={bubbleRef} className={`message-bubble message-bubble-${type}`} onTouchStart={startLongPress} onTouchEnd={cancelLongPress} onTouchMove={cancelLongPress} onTouchCancel={cancelLongPress}>
       {availableActions && <div className="message-actions-menu">
         <button ref={triggerRef} type="button" className="message-actions-trigger" aria-label="Ações da mensagem" title="Ações da mensagem" aria-expanded={menuOpen || reactionOpen} onClick={openMenu}><ChevronDown size={16} strokeWidth={2.4} /></button>
         {actionPortal}
@@ -3834,7 +4307,7 @@ function MessageBubble({ id, side, sender, senderId, role, text, time, status, e
       {forwardedFrom && <div className="forwarded-label"><ArrowLeftRight size={13}/> Encaminhada</div>}
       {replyTo && <button type="button" className="reply-reference" onClick={() => onJump?.(replyTo.id)}><strong>{replyTo.unavailable ? "Mensagem indisponivel" : `Respondendo a ${replyTo.sender}`}</strong><span><HighlightedText text={replyTo.text} query={searchQuery} /></span></button>}
       {type === "album" ? <AlbumAttachment files={albumFiles} caption={text} />
-        : type === "audio" && audio?.url ? <div className="audio-message"><Mic size={16}/><audio controls preload="metadata" src={mediaUrl(audio.url)} /><small>{audio.durationSeconds ? `${audio.durationSeconds}s` : "Audio gravado"}</small></div>
+        : type === "audio" && audio?.url ? <div className="audio-message"><Mic size={16}/><ChatAudioPlayer audio={audio} src={mediaUrl(audio.url)} isOwnMessage={isOwnMessage} /></div>
         : type === "file" && file ? <><FileAttachment file={file} searchQuery={searchQuery} />{showAttachmentCaption && <div className="attachment-caption">{attachmentCaption.split("\n").map((line, i) => <span key={i}><HighlightedText text={line} query={searchQuery} /></span>)}</div>}</>
         : String(text || "").split("\n").map((line, i) => <span key={i}><HighlightedText text={line} query={searchQuery} /></span>)}
       {editedAt && <small className="message-edited-label">(Editada às {new Date(editedAt).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })})</small>}
@@ -4704,7 +5177,7 @@ function ProfileSettingsPage({ currentUser, theme, onThemeChange, onCurrentUserU
     <section className="profile-modern-grid">
       <article className="panel profile-modern-card"><div className="settings-heading"><span className="large-setting-icon"><Users/></span><div><h2>Dados profissionais</h2><p>Informações exibidas no diretório corporativo.</p></div></div><div className="form-grid"><label><span>Nome de exibição</span><input value={form.displayName} onChange={(event)=>setForm({...form,displayName:event.target.value})}/></label><label><span>Cargo</span><input value={form.jobTitle} onChange={(event)=>setForm({...form,jobTitle:event.target.value})}/></label><label><span>Departamento</span><input value={currentUser.department || currentUser.dept || ""} disabled /></label><label><span>Status</span><select value={form.status} onChange={(event)=>setForm({...form,status:event.target.value})}><option>Online</option><option>Ocupado</option><option>Ausente</option><option>Offline</option></select></label><label className="full"><span>Assinatura</span><textarea value={form.signature} onChange={(event)=>setForm({...form,signature:event.target.value})}/></label></div></article>
       <article className="panel profile-modern-card"><div className="settings-heading"><span className="large-setting-icon"><Contact/></span><div><h2>Contato</h2><p>Canais usados no diretório interno.</p></div></div><div className="form-grid"><label><span>E-mail corporativo</span><input value={currentUser.email || ""} disabled /></label><label><span>Telefone</span><input value={form.phone} onChange={(event)=>setForm({...form,phone:event.target.value})}/></label><label><span>Ramal</span><input value={form.extension} onChange={(event)=>setForm({...form,extension:event.target.value})}/></label></div></article>
-      <article className="panel profile-modern-card"><div className="settings-heading"><span className="large-setting-icon"><Bell/></span><div><h2>Preferências</h2><p>Tema, idioma e notificações.</p></div></div><div className="form-grid"><fieldset className="theme-choice"><legend>Tema</legend><label><input type="radio" name="profile-theme" value="light" checked={(form.preferences.theme || "light") === "light"} onChange={(event)=>changeTheme(event.target.value)}/> Claro</label><label><input type="radio" name="profile-theme" value="dark" checked={form.preferences.theme === "dark"} onChange={(event)=>changeTheme(event.target.value)}/> Escuro</label></fieldset><label><span>Idioma</span><select value={form.preferences.language || "pt-BR"} onChange={(event)=>setForm({...form,preferences:{...form.preferences,language:event.target.value}})}><option value="pt-BR">Português</option></select></label><fieldset className="message-font-size-choice"><legend>Tamanho da fonte das mensagens</legend>{MESSAGE_FONT_SIZE_OPTIONS.map((option)=><label key={option.value}><input type="radio" name="message-font-size" value={option.value} checked={(form.preferences.messageFontSize || "default") === option.value} onChange={(event)=>savePreferencePatch({messageFontSize:event.target.value})}/><span>{option.label}</span><small>{option.size}</small></label>)}</fieldset><label className="check-row"><input type="checkbox" checked={form.preferences.notifications !== false} onChange={(event)=>savePreferencePatch({notifications:event.target.checked})}/> Receber notificações internas</label></div><div className="notification-preferences"><div className="notification-permission"><div><strong>Notificações do navegador</strong><span>{notificationStatus}</span><small>{pushStatusLabel}</small></div><button className="secondary-button" type="button" onClick={requestNotifications} disabled={pushStatus === "subscribed"}><Bell size={15}/> {pushStatus === "subscribed" ? "Push ativado" : "Ativar notificações push"}</button><button className="secondary-button" type="button" onClick={testPushNotification} disabled={testingPush}><Bell size={15}/> {testingPush ? "Testando..." : "Testar notificação"}</button></div><div className="push-diagnostic-grid push-diagnostic-grid-wide"><span><strong>Push</strong><small>{pushStatus === "subscribed" ? "Ativo" : "Inativo"}</small></span><span><strong>Permissão</strong><small>{pushPermissionLabel}</small></span><span><strong>Subscription</strong><small>{pushDiagnostic?.subscription ? "Registrada" : "Não registrada"}</small></span><span><strong>Service Worker</strong><small>{pushDiagnostic?.serviceWorker ? "Ativo" : "Inativo"}</small></span><span><strong>Notificações</strong><small>{pushStatus === "subscribed" && notificationPermission === "granted" ? "Ativadas" : "Verificar"}</small></span><span><strong>Som do sistema</strong><small>Verificar Android</small></span><span><strong>Vibração</strong><small>{pushDiagnostic?.vibrationSupported ? "Suportada" : "Não detectada"}</small></span></div><small className="push-diagnostic-note">{pushDiagnostic?.displayMode || "Verificando dispositivo"} · O Web Push usa silent:false, renotify:true e vibração [200, 100, 200]. No Android, o som é o padrão do canal de notificações do PWA; se não tocar, verifique se o canal do Chat | Cipolatti não está marcado como silencioso nas configurações do aparelho.</small><Toggle label="Mostrar conteúdo da mensagem" description="Exibe remetente e prévia quando o navegador mostrar o aviso." checked={form.preferences.showNotificationContent !== false} onChange={(value)=>savePreferencePatch({showNotificationContent:value})}/><Toggle label="Som de nova mensagem" description="Toca um alerta discreto em intervalos controlados." checked={form.preferences.notificationSound === true} onChange={(value)=>savePreferencePatch({notificationSound:value})}/><Toggle label="Piscar/contador da janela" description="Mantém contador no título enquanto houver mensagens pendentes." checked={form.preferences.flashWindowTitle !== false} onChange={(value)=>savePreferencePatch({flashWindowTitle:value})}/><Toggle label="Notificações do Windows" description="Usa avisos nativos do navegador quando permitido." checked={form.preferences.browserNotifications !== false} onChange={(value)=>savePreferencePatch({browserNotifications:value})}/><Toggle label="Repetir alerta até leitura" description="Repete o banner e o aviso a cada 60 segundos enquanto a conversa não for aberta." checked={form.preferences.repeatAlertsUntilRead !== false} onChange={(value)=>savePreferencePatch({repeatAlertsUntilRead:value})}/><Toggle label="Não perturbe" description="Silencia banners, sons e avisos persistentes temporariamente." checked={form.preferences.doNotDisturb === true} onChange={(value)=>savePreferencePatch({doNotDisturb:value})}/><div className="quiet-hours-fields"><label><span>Horário silencioso início</span><input type="time" value={form.preferences.quietHoursStart || ""} onChange={(event)=>savePreferencePatch({quietHoursStart:event.target.value})}/></label><label><span>Horário silencioso fim</span><input type="time" value={form.preferences.quietHoursEnd || ""} onChange={(event)=>savePreferencePatch({quietHoursEnd:event.target.value})}/></label></div><Toggle label="Notificar mensagens individuais" description="Avisar novas conversas diretas quando esta aba estiver em segundo plano." checked={form.preferences.notifyDirectMessages !== false} onChange={(value)=>savePreferencePatch({notifyDirectMessages:value})}/><Toggle label="Notificar grupos" description="Avisar novas mensagens de grupos dos quais você participa." checked={form.preferences.notifyGroups !== false} onChange={(value)=>savePreferencePatch({notifyGroups:value})}/></div></article>
+      <article className="panel profile-modern-card"><div className="settings-heading"><span className="large-setting-icon"><Bell/></span><div><h2>Preferências</h2><p>Tema, idioma e notificações.</p></div></div><div className="form-grid"><fieldset className="theme-choice"><legend>Tema</legend><label><input type="radio" name="profile-theme" value="light" checked={(form.preferences.theme || "light") === "light"} onChange={(event)=>changeTheme(event.target.value)}/> Claro</label><label><input type="radio" name="profile-theme" value="dark" checked={form.preferences.theme === "dark"} onChange={(event)=>changeTheme(event.target.value)}/> Escuro</label></fieldset><label><span>Idioma</span><select value={form.preferences.language || "pt-BR"} onChange={(event)=>setForm({...form,preferences:{...form.preferences,language:event.target.value}})}><option value="pt-BR">Português</option></select></label><fieldset className="message-font-size-choice"><legend>Tamanho da fonte das mensagens</legend>{MESSAGE_FONT_SIZE_OPTIONS.map((option)=><label key={option.value}><input type="radio" name="message-font-size" value={option.value} checked={(form.preferences.messageFontSize || "default") === option.value} onChange={(event)=>savePreferencePatch({messageFontSize:event.target.value})}/><span>{option.label}</span><small>{option.size}</small></label>)}</fieldset><label className="check-row"><input type="checkbox" checked={form.preferences.notifications !== false} onChange={(event)=>savePreferencePatch({notifications:event.target.checked})}/> Receber notificações internas</label></div><div className="notification-preferences"><div className="notification-permission"><div><strong>Notificações do navegador</strong><span>{notificationStatus}</span><small>{pushStatusLabel}</small></div><button className="secondary-button" type="button" onClick={requestNotifications} disabled={pushStatus === "subscribed"}><Bell size={15}/> {pushStatus === "subscribed" ? "Push ativado" : "Ativar notificações push"}</button><button className="secondary-button" type="button" onClick={testPushNotification} disabled={testingPush}><Bell size={15}/> {testingPush ? "Testando..." : "Testar notificação"}</button></div><div className="push-diagnostic-grid push-diagnostic-grid-wide"><span><strong>Push</strong><small>{pushStatus === "subscribed" ? "Ativo" : "Inativo"}</small></span><span><strong>Permissão</strong><small>{pushPermissionLabel}</small></span><span><strong>Subscription</strong><small>{pushDiagnostic?.subscription ? "Registrada" : "Não registrada"}</small></span><span><strong>Service Worker</strong><small>{pushDiagnostic?.serviceWorker ? "Ativo" : "Inativo"}</small></span><span><strong>Notificações</strong><small>{pushStatus === "subscribed" && notificationPermission === "granted" ? "Ativadas" : "Verificar"}</small></span><span><strong>Som do sistema</strong><small>Verificar Android</small></span><span><strong>Vibração</strong><small>{pushDiagnostic?.vibrationSupported ? "Suportada" : "Não detectada"}</small></span><span><strong>Badge do app</strong><small>{pushDiagnostic?.badgingSupported ? "Suportado" : "Não suportado"}</small></span></div><small className="push-diagnostic-note">{pushDiagnostic?.displayMode || "Verificando dispositivo"} · O Web Push usa silent:false, renotify:true e vibração [200, 100, 200]. No Android, o som é o padrão do canal de notificações do PWA; se não tocar, verifique se o canal do Chat | Cipolatti não está marcado como silencioso nas configurações do aparelho.</small><Toggle label="Mostrar conteúdo da mensagem" description="Exibe remetente e prévia quando o navegador mostrar o aviso." checked={form.preferences.showNotificationContent !== false} onChange={(value)=>savePreferencePatch({showNotificationContent:value})}/><Toggle label="Som de nova mensagem" description="Toca um alerta discreto em intervalos controlados." checked={form.preferences.notificationSound === true} onChange={(value)=>savePreferencePatch({notificationSound:value})}/><Toggle label="Piscar/contador da janela" description="Mantém contador no título enquanto houver mensagens pendentes." checked={form.preferences.flashWindowTitle !== false} onChange={(value)=>savePreferencePatch({flashWindowTitle:value})}/><Toggle label="Notificações do Windows" description="Usa avisos nativos do navegador quando permitido." checked={form.preferences.browserNotifications !== false} onChange={(value)=>savePreferencePatch({browserNotifications:value})}/><Toggle label="Repetir alerta até leitura" description="Repete o banner e o aviso a cada 60 segundos enquanto a conversa não for aberta." checked={form.preferences.repeatAlertsUntilRead !== false} onChange={(value)=>savePreferencePatch({repeatAlertsUntilRead:value})}/><Toggle label="Lembretes de mensagens não lidas" description="Quando ativado, o Chat poderá enviar novos alertas enquanto houver mensagens importantes ainda não visualizadas." checked={form.preferences.unreadMessageReminders !== false} onChange={(value)=>savePreferencePatch({unreadMessageReminders:value})}/><Toggle label="Não perturbe" description="Silencia banners, sons e avisos persistentes temporariamente." checked={form.preferences.doNotDisturb === true} onChange={(value)=>savePreferencePatch({doNotDisturb:value})}/><div className="quiet-hours-fields"><label><span>Horário silencioso início</span><input type="time" value={form.preferences.quietHoursStart || ""} onChange={(event)=>savePreferencePatch({quietHoursStart:event.target.value})}/></label><label><span>Horário silencioso fim</span><input type="time" value={form.preferences.quietHoursEnd || ""} onChange={(event)=>savePreferencePatch({quietHoursEnd:event.target.value})}/></label></div><Toggle label="Notificar mensagens individuais" description="Avisar novas conversas diretas quando esta aba estiver em segundo plano." checked={form.preferences.notifyDirectMessages !== false} onChange={(value)=>savePreferencePatch({notifyDirectMessages:value})}/><Toggle label="Notificar grupos" description="Avisar novas mensagens de grupos dos quais você participa." checked={form.preferences.notifyGroups !== false} onChange={(value)=>savePreferencePatch({notifyGroups:value})}/></div></article>
       <article className="panel profile-modern-card out-of-office-card"><div className="settings-heading"><span className="large-setting-icon"><Clock3/></span><div><h2>Fora da empresa</h2><p>Resposta automática para conversas privadas durante ausências programadas.</p></div></div><div className="out-of-office-status"><Status>{outOfOffice.label || "Desativado"}</Status></div><div className="form-grid"><label className="check-row full"><input type="checkbox" checked={outOfOffice.enabled} onChange={(event)=>setOutOfOffice({...outOfOffice,enabled:event.target.checked})}/> Ativar “Fora da empresa”</label><label><span>Data e hora de início</span><input type="datetime-local" value={outOfOffice.startAt} onChange={(event)=>setOutOfOffice({...outOfOffice,startAt:event.target.value})}/></label><label><span>Data e hora de retorno</span><input type="datetime-local" value={outOfOffice.endAt} onChange={(event)=>setOutOfOffice({...outOfOffice,endAt:event.target.value})}/></label><label className="full"><span>Mensagem automática</span><textarea maxLength={1000} value={outOfOffice.message} onChange={(event)=>setOutOfOffice({...outOfOffice,message:event.target.value})} placeholder="Olá! Estou fora da empresa e retornarei em breve. Em caso de urgência, entre em contato com meu departamento."/></label></div><div className="out-of-office-actions"><small>{outOfOffice.message.length}/1000 caracteres · respostas automáticas são enviadas uma vez por conversa a cada 24 horas.</small><div><button type="button" className="secondary-button" disabled={savingOutOfOffice} onClick={disableOutOfOffice}>Desativar agora</button><button type="button" className="primary-button" disabled={savingOutOfOffice} onClick={saveOutOfOffice}><Save size={16}/> {savingOutOfOffice ? "Salvando..." : "Salvar"}</button></div></div></article>
       <article className="panel profile-modern-card"><div className="settings-heading"><span className="large-setting-icon"><ShieldCheck/></span><div><h2>Segurança</h2><p>Acesso local e Active Directory.</p></div></div><div className="security-banner profile-security-banner"><ShieldCheck/><div><strong>Manter conectado</strong><span>Sessões persistentes usam token seguro, validação no AD e rotação automática.</span></div></div><div className="security-banner profile-security-banner muted"><KeyRound/><div><strong>Active Directory</strong><span>A senha é gerenciada pelo AD e nunca fica armazenada no CIPOLATTI CHAT.</span></div></div><button className="danger-button full-width-security-action" onClick={logoutEverywhere}>Sair de todos os dispositivos</button></article>
       <article className="panel profile-modern-card about-build-card"><div className="settings-heading"><span className="large-setting-icon"><MonitorUp/></span><div><h2>Sobre</h2><p>Versão instalada neste dispositivo.</p></div></div><div className="about-build-info"><span>Frontend</span><strong>{FRONTEND_BUILD_VERSION}</strong><small>Service worker: {pushDiagnostic?.serviceWorkerVersion || "verificando"} · {pushDiagnostic?.serviceWorkerState || "sem estado"} · {pushDiagnostic?.controlled ? "controlando a página" : "sem controle ativo"}</small><small>Scope: {pushDiagnostic?.serviceWorkerScope || "-"}</small><small>Atualização pendente: {pushDiagnostic?.updateAvailable ? "sim" : "não"}</small></div></article>
@@ -5787,4 +6260,6 @@ function App() {
 }
 
 export default App;
+
+
 

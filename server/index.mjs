@@ -48,6 +48,64 @@ function json(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
+const internalEventClients = new Map();
+
+function registerInternalEventClient(request, response) {
+  const userId = request.auth?.id;
+  if (!userId) return json(response, 401, { error: "Autenticação obrigatória." });
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  response.write(`event: ready\ndata: ${JSON.stringify({ ok: true, at: new Date().toISOString() })}\n\n`);
+  const clients = internalEventClients.get(userId) || new Set();
+  clients.add(response);
+  internalEventClients.set(userId, clients);
+  const keepAlive = setInterval(() => response.write(`: keepalive ${Date.now()}\n\n`), 25_000);
+  request.on("close", () => {
+    clearInterval(keepAlive);
+    clients.delete(response);
+    if (!clients.size) internalEventClients.delete(userId);
+  });
+}
+
+function emitInternalEvent(userId, event, payload) {
+  const clients = internalEventClients.get(userId);
+  if (!clients?.size) return;
+  const data = JSON.stringify(payload);
+  for (const response of [...clients]) {
+    try {
+      response.write(`event: ${event}\ndata: ${data}\n\n`);
+    } catch {
+      clients.delete(response);
+    }
+  }
+  if (!clients.size) internalEventClients.delete(userId);
+}
+
+function broadcastInternalConversation(data, conversationId, actorId, reason, changedMessageIds = [], timing = {}) {
+  const conversation = (data.internalConversations || []).find((item) => item.id === conversationId);
+  if (!conversation) return;
+  ensureInternalShape(conversation);
+  const participantIds = [...new Set((conversation.participantIds || []).filter(Boolean))];
+  const broadcastAt = new Date().toISOString();
+  for (const userId of participantIds) {
+    const user = (data.users || []).find((item) => item.id === userId);
+    if (!user) continue;
+    emitInternalEvent(userId, "internal-conversation", {
+      type: "internal-conversation",
+      reason,
+      actorId,
+      conversationId,
+      changedMessageIds,
+      timing: { ...timing, broadcastAt },
+      conversation: internalConversationView(data, conversation, user),
+    });
+  }
+}
+
 function pushConfigured() {
   return Boolean(vapidPublicKey && vapidPrivateKey);
 }
@@ -116,6 +174,12 @@ function pushMessagePreview(message = {}, showContent = true) {
   return String(message.text || "Nova mensagem").replace(/\s+/g, " ").trim().slice(0, 160);
 }
 
+function pushBadgeCount(data, user) {
+  if (!user?.id) return 0;
+  const counts = buildUnreadCounts(data, user);
+  return Math.max(0, Number(counts.messagesUnread || 0) + Number(counts.notificationsUnread || 0));
+}
+
 async function removeDeadPushSubscription(endpoint) {
   await updateStore((data) => {
     data.pushSubscriptions = ensurePushSubscriptions(data).filter((item) => item.endpoint !== endpoint);
@@ -140,6 +204,15 @@ async function sendPushToUser(data, userId, payloadFactory, meta = {}) {
   const subscriptions = ensurePushSubscriptions(data).filter((item) => item.userId === userId && item.endpoint && item.keys?.p256dh && item.keys?.auth);
   if (!subscriptions.length) return;
   const payload = payloadFactory(user);
+  console.info("CIPOLATTI notification", JSON.stringify({
+    notificationSource: meta.notificationSource || payload.data?.type || "push",
+    messageId: payload.data?.messageId || "",
+    conversationId: payload.data?.conversationId || payload.data?.groupId || "",
+    messageCreatedAt: payload.data?.messageCreatedAt || "",
+    notificationCreatedAt: new Date().toISOString(),
+    userId,
+    reason: meta.reason || "web-push",
+  }));
   await Promise.allSettled(subscriptions.map(async (item) => {
     try {
       const result = await deliverWebPush(item, payload);
@@ -178,6 +251,7 @@ async function sendNotificationPush(data, notificationId) {
       body: message,
       icon: "/chat-cipolatti-icon-v3-192.png",
       badge: "/chat-cipolatti-icon-v3-192.png",
+      badgeCount: pushBadgeCount(data, user),
       tag: `cipolatti-notification-${notification.id}`,
       renotify: true,
       data: {
@@ -212,18 +286,20 @@ async function sendInternalMessagePush(data, conversationId, messageId, senderId
       body: showContent ? `${senderName}: ${preview}` : preview,
       icon: "/chat-cipolatti-icon-v3-192.png",
       badge: "/chat-cipolatti-icon-v3-192.png",
+      badgeCount: pushBadgeCount(data, user),
       tag: `cipolatti-${conversation.id}`,
       renotify: true,
       data: {
         type: "message",
         conversationId: conversation.id,
         messageId: message.id,
+        messageCreatedAt: message.createdAt || "",
         senderId: message.senderId || senderId || "",
         groupId: isGroup ? conversation.id : "",
         isGroup,
       },
     };
-  }, { isGroup })));
+  }, { isGroup, notificationSource: "push", reason: "new-message-created" })));
 }
 
 async function readBody(request, limit = 5 * 1024 * 1024) {
@@ -795,6 +871,188 @@ function buildUnreadCounts(data, actor) {
       return sum + (notification.readBy?.[actor.id] ? 0 : 1);
     }, 0);
   return { notificationsUnread, messagesUnread };
+}
+
+const unreadReminderFeatureStartedAt = new Date("2026-08-31T12:13:30.410Z").getTime();
+const unreadReminderDelaysMs = [5 * 60 * 1000, 10 * 60 * 1000, 15 * 60 * 1000];
+
+function ensureUnreadReminderStates(data) {
+  data.unreadReminderStates = Array.isArray(data.unreadReminderStates) ? data.unreadReminderStates : [];
+  return data.unreadReminderStates;
+}
+
+function unreadMessagesForUser(conversation, userId) {
+  ensureInternalShape(conversation);
+  const lastRead = conversation.readBy?.[userId] ? new Date(conversation.readBy[userId]).getTime() : 0;
+  return (conversation.messages || []).filter((message) => {
+    const notifiedSystemMessage = message.type === "system" && Array.isArray(message.notifyUserIds) && message.notifyUserIds.includes(userId);
+    if (message.deletedAt || message.senderId === userId) return false;
+    if (message.type === "system" && !notifiedSystemMessage) return false;
+    const createdAt = new Date(message.createdAt || 0).getTime();
+    return Number.isFinite(createdAt) && createdAt > lastRead;
+  });
+}
+
+function reminderAnchorMs(state = {}) {
+  const values = [state.reminderStartedAt, state.firstMessageCreatedAt, state.createdAt]
+    .map((value) => new Date(value || 0).getTime())
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return Math.max(unreadReminderFeatureStartedAt, ...values);
+}
+
+function unreadMessagesForReminder(conversation, userId, state = {}) {
+  const anchor = reminderAnchorMs(state);
+  return unreadMessagesForUser(conversation, userId).filter((message) => {
+    const createdAt = new Date(message.createdAt || 0).getTime();
+    return Number.isFinite(createdAt) && createdAt >= anchor;
+  });
+}
+
+function cancelUnreadReminder(data, userId, conversationId) {
+  const before = ensureUnreadReminderStates(data).length;
+  data.unreadReminderStates = data.unreadReminderStates.filter((item) => !(item.userId === userId && item.conversationId === conversationId));
+  return before - data.unreadReminderStates.length;
+}
+
+function scheduleUnreadReminders(data, conversation, message, senderId) {
+  if (!message?.id || message.deletedAt || message.type === "system") return;
+  ensureInternalShape(conversation);
+  const now = new Date(message.createdAt || Date.now());
+  if (now.getTime() < unreadReminderFeatureStartedAt) return;
+  const states = ensureUnreadReminderStates(data);
+  const isGroup = conversation.type === "group";
+  for (const userId of conversation.participantIds || []) {
+    if (!userId || userId === senderId) continue;
+    const user = (data.users || []).find((item) => item.id === userId);
+    if (!user || user.preferences?.unreadMessageReminders === false || !pushAllowedForUser(user, { isGroup })) continue;
+    const draftState = { createdAt: now.toISOString(), reminderStartedAt: now.toISOString(), firstMessageCreatedAt: message.createdAt || now.toISOString() };
+    if (!unreadMessagesForReminder(conversation, userId, draftState).length) continue;
+    let state = states.find((item) => item.userId === userId && item.conversationId === conversation.id && !item.completedAt);
+    if (!state) {
+      state = {
+        id: createId("unread-reminder"),
+        userId,
+        conversationId: conversation.id,
+        createdAt: now.toISOString(),
+        reminderStartedAt: now.toISOString(),
+        firstMessageId: message.id,
+        firstMessageCreatedAt: message.createdAt || now.toISOString(),
+        reminderIndex: 0,
+        nextReminderAt: new Date(now.getTime() + unreadReminderDelaysMs[0]).toISOString(),
+      };
+      states.push(state);
+    }
+    state.reminderStartedAt ||= state.firstMessageCreatedAt || state.createdAt || now.toISOString();
+    state.firstMessageId ||= message.id;
+    state.firstMessageCreatedAt ||= message.createdAt || now.toISOString();
+    state.updatedAt = now.toISOString();
+    state.isGroup = isGroup;
+    state.lastMessageId = message.id;
+    state.lastSenderId = message.senderId || senderId || "";
+    state.lastSenderName = message.sender || "CIPOLATTI";
+    state.conversationTitle = conversation.title || "";
+    state.unreadCount = unreadMessagesForReminder(conversation, userId, state).length;
+  }
+}
+
+function unreadReminderPayload(data, user, conversation, state, unreadMessages) {
+  const isGroup = conversation.type === "group";
+  const count = unreadMessages.length;
+  const showContent = user.preferences?.showNotificationContent !== false;
+  const senderName = state.lastSenderName || unreadMessages.at(-1)?.sender || "CIPOLATTI";
+  const groupTitle = conversation.title || "Grupo interno";
+  const title = isGroup
+    ? `Mensagens não lidas em ${groupTitle}`
+    : count > 1 ? `${count} mensagens não lidas de ${senderName}` : `Mensagem não lida de ${senderName}`;
+  const body = showContent
+    ? isGroup
+      ? `Você possui ${count} mensagem${count === 1 ? "" : "s"} aguardando visualização.`
+      : count > 1 ? `Você possui ${count} mensagens aguardando visualização.` : "Você ainda possui uma mensagem não visualizada."
+    : "Abra o Chat | Cipolatti para ver mensagens não lidas.";
+  return {
+    title,
+    body,
+    icon: "/chat-cipolatti-icon-v3-192.png",
+    badge: "/chat-cipolatti-icon-v3-192.png",
+    badgeCount: pushBadgeCount(data, user),
+    tag: `cipolatti-unread-${conversation.id}`,
+    renotify: true,
+    silent: false,
+    vibrate: [200, 100, 200],
+    timestamp: Date.now(),
+    data: {
+      type: "unread_reminder",
+      conversationId: conversation.id,
+      messageId: state.lastMessageId || unreadMessages.at(-1)?.id || "",
+      messageCreatedAt: unreadMessages.at(-1)?.createdAt || state.firstMessageCreatedAt || "",
+      senderId: state.lastSenderId || "",
+      groupId: isGroup ? conversation.id : "",
+      isGroup,
+      unreadCount: count,
+      badgeCount: pushBadgeCount(data, user),
+    },
+  };
+}
+
+async function processUnreadReminderQueue(reason = "timer") {
+  const snapshot = await readStore();
+  const snapshotStates = Array.isArray(snapshot.unreadReminderStates) ? snapshot.unreadReminderStates : [];
+  if (!snapshotStates.length) return;
+  const nowMs = Date.now();
+  const hasDueWork = snapshotStates.some((state) => !state.completedAt && state.nextReminderAt && new Date(state.nextReminderAt).getTime() <= nowMs);
+  const hasOldCompleted = snapshotStates.some((state) => state.completedAt && new Date(state.completedAt).getTime() <= nowMs - 24 * 60 * 60 * 1000);
+  if (!hasDueWork && !hasOldCompleted) return;
+  const dueJobs = [];
+  await updateStore((data) => {
+    const now = new Date();
+    const states = ensureUnreadReminderStates(data);
+    for (const state of states) {
+      if (state.completedAt || !state.nextReminderAt) continue;
+      if (new Date(state.nextReminderAt).getTime() > now.getTime()) continue;
+      const user = (data.users || []).find((item) => item.id === state.userId);
+      const conversation = (data.internalConversations || []).find((item) => item.id === state.conversationId);
+      if (!state.reminderStartedAt || !state.firstMessageCreatedAt) {
+        state.completedAt = now.toISOString();
+        state.completedReason = "legacy_without_anchor";
+        continue;
+      }
+      if (!user || !conversation || !canAccessInternalConversation(user, conversation)) {
+        state.completedAt = now.toISOString();
+        state.completedReason = "inaccessible";
+        continue;
+      }
+      const unreadMessages = unreadMessagesForReminder(conversation, user.id, state);
+      if (!unreadMessages.length) {
+        state.completedAt = now.toISOString();
+        state.completedReason = "read";
+        continue;
+      }
+      const isGroup = conversation.type === "group";
+      if (user.preferences?.unreadMessageReminders === false || !pushAllowedForUser(user, { isGroup })) {
+        state.nextReminderAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+        state.updatedAt = now.toISOString();
+        continue;
+      }
+      dueJobs.push({ userId: user.id, isGroup, payload: unreadReminderPayload(data, user, conversation, state, unreadMessages) });
+      state.reminderIndex = Number(state.reminderIndex || 0) + 1;
+      state.sentCount = Number(state.sentCount || 0) + 1;
+      state.lastSentAt = now.toISOString();
+      state.updatedAt = now.toISOString();
+      state.unreadCount = unreadMessages.length;
+      if (state.reminderIndex >= unreadReminderDelaysMs.length) {
+        state.completedAt = now.toISOString();
+        state.completedReason = "max_sent";
+      } else {
+        state.nextReminderAt = new Date(now.getTime() + unreadReminderDelaysMs[state.reminderIndex]).toISOString();
+      }
+    }
+    data.unreadReminderStates = states.filter((item) => !item.completedAt || new Date(item.completedAt).getTime() > now.getTime() - 24 * 60 * 60 * 1000);
+  });
+  if (dueJobs.length) {
+    const data = await readStore();
+    await Promise.allSettled(dueJobs.map((job) => sendPushToUser(data, job.userId, () => job.payload, { isGroup: job.isGroup, notificationSource: "unread-reminder", reason: "unread-reminder-due" })));
+    console.info(`Lembretes Web Push processados (${reason}): ${dueJobs.length}`);
+  }
 }
 
 function canManageInternalConversation(actor, conversation) {
@@ -1481,6 +1739,9 @@ async function handleApi(request, response, url) {
   if (url.pathname === "/api/presence/debug" && request.method === "GET") {
     return json(response, 200, presenceDiagnosticsForActor(request.auth));
   }
+  if (url.pathname === "/api/internal/events" && request.method === "GET") {
+    return registerInternalEventClient(request, response);
+  }
   if (url.pathname === "/api/admin/persistent-sessions" && request.method === "GET") {
     if (!requireRole(request, response, ["Administrador"])) return;
     return json(response, 200, await listPersistentSessions(request.auth));
@@ -1805,6 +2066,7 @@ async function handleApi(request, response, url) {
           ensureInternalShape(conversation);
           conversation.readBy[request.auth.id] = now;
           markRelatedConversationNotificationsRead(data, request.auth, conversation, now, notification.messageId || "");
+          cancelUnreadReminder(data, request.auth.id, conversation.id);
         }
         updated = notificationView(notification, request.auth, data);
         counts = buildUnreadCounts(data, request.auth);
@@ -1847,6 +2109,17 @@ async function handleApi(request, response, url) {
     let updated;
     let skippedDuplicateMessage = false;
     const pushJobs = [];
+    const changedConversationIds = new Set();
+    const changedMessageIdsByConversation = new Map();
+    const requestStartedAt = new Date().toISOString();
+    const rememberChangedMessage = (conversationId, messageId) => {
+      if (!conversationId) return;
+      changedConversationIds.add(conversationId);
+      if (!messageId) return;
+      const ids = changedMessageIdsByConversation.get(conversationId) || [];
+      ids.push(messageId);
+      changedMessageIdsByConversation.set(conversationId, ids);
+    };
     try {
       if (["audio", "files"].includes(internalMatch[2])) {
         const snapshot = await readStore();
@@ -1873,6 +2146,7 @@ async function handleApi(request, response, url) {
           const now = new Date().toISOString();
           conversation.readBy[request.auth.id] = now;
           markRelatedConversationNotificationsRead(data, request.auth, conversation, now);
+          cancelUnreadReminder(data, request.auth.id, conversation.id);
           updated = conversation;
           return;
         }
@@ -1911,7 +2185,9 @@ async function handleApi(request, response, url) {
               status: "sent",
             };
             conversation.messages.push(message);
+            rememberChangedMessage(conversation.id, message.id);
             pushJobs.push({ type: "message", conversationId: conversation.id, messageId: message.id, senderId: request.auth.id });
+            scheduleUnreadReminders(data, conversation, message, request.auth.id);
           }
         } else if (internalMatch[2] === "audio") {
           if (conversation.status === "closed") throw new Error("A conversa está encerrada.");
@@ -1935,7 +2211,9 @@ async function handleApi(request, response, url) {
             status: "sent",
           };
           conversation.messages.push(message);
+          rememberChangedMessage(conversation.id, message.id);
           pushJobs.push({ type: "message", conversationId: conversation.id, messageId: message.id, senderId: request.auth.id });
+          scheduleUnreadReminders(data, conversation, message, request.auth.id);
         } else if (internalMatch[2] === "files") {
           if (conversation.status === "closed") throw new Error("A conversa est? encerrada.");
           assertCanSendInternalMessage(request.auth, conversation);
@@ -1972,7 +2250,9 @@ async function handleApi(request, response, url) {
             status: "sent",
           };
           conversation.messages.push(message);
+          rememberChangedMessage(conversation.id, message.id);
           pushJobs.push({ type: "message", conversationId: conversation.id, messageId: message.id, senderId: request.auth.id });
+          scheduleUnreadReminders(data, conversation, message, request.auth.id);
         } else if (internalMatch[2] === "react") {
           if (conversation.status === "closed") throw new Error("A conversa est? encerrada.");
           ensureInternalShape(conversation);
@@ -2172,7 +2452,9 @@ async function handleApi(request, response, url) {
                   status: "sent",
                 };
                 destination.messages.push(message);
+                rememberChangedMessage(destination.id, message.id);
                 pushJobs.push({ type: "message", conversationId: destination.id, messageId: message.id, senderId: request.auth.id });
+                scheduleUnreadReminders(data, destination, message, request.auth.id);
               }
             } else {
               const message = {
@@ -2186,7 +2468,9 @@ async function handleApi(request, response, url) {
                 status: "sent",
               };
               destination.messages.push(message);
+              rememberChangedMessage(destination.id, message.id);
               pushJobs.push({ type: "message", conversationId: destination.id, messageId: message.id, senderId: request.auth.id });
+              scheduleUnreadReminders(data, destination, message, request.auth.id);
             }
             destination.updatedAt = new Date().toISOString();
             destination.lastMessageAt = destination.updatedAt;
@@ -2212,11 +2496,19 @@ async function handleApi(request, response, url) {
         conversation.lastMessageAt = conversation.updatedAt;
         conversation.readBy ||= {};
         conversation.readBy[request.auth.id] = conversation.updatedAt;
+        changedConversationIds.add(conversation.id);
         updated = conversation;
         audit(data, request, `Conversa interna: ${internalMatch[2]}`, conversation.title);
       });
       const data = await readStore();
       const view = internalConversationView(data, updated, request.auth);
+      const backendPersistedAt = new Date().toISOString();
+      for (const conversationId of changedConversationIds) {
+        broadcastInternalConversation(data, conversationId, request.auth.id, internalMatch[2], changedMessageIdsByConversation.get(conversationId) || [], {
+          requestStartedAt,
+          backendPersistedAt,
+        });
+      }
       pushJobs.forEach(dispatchPushJob);
       if (internalMatch[2] === "read") return json(response, 200, { conversation: view, counts: buildUnreadCounts(data, request.auth) });
       if (internalMatch[2] === "messages") view.skippedDuplicateMessage = skippedDuplicateMessage;
@@ -2897,3 +3189,5 @@ server.on("upgrade", (request, socket, head) => {
 const host = process.env.HOST || "0.0.0.0";
 server.listen(port, host, () => console.log(`Kalion WhatsApp backend ${releaseVersion} ativo em http://${host}:${port}`));
 setInterval(runWaitingMessages, 15_000).unref();
+setInterval(() => processUnreadReminderQueue("timer").catch((error) => console.warn(`Falha ao processar lembretes de não lidas: ${error.message || error}`)), 60_000).unref();
+processUnreadReminderQueue("startup").catch((error) => console.warn(`Falha ao iniciar lembretes de não lidas: ${error.message || error}`));

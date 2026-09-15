@@ -1,4 +1,4 @@
-self.CIPOLATTI_CHAT_SW_VERSION = "20260827-pwa-resume-sync-v1";
+self.CIPOLATTI_CHAT_SW_VERSION = "20260914-realtime-read-compose-v1";
 self.CIPOLATTI_CHAT_CACHE_PREFIX = "cipolatti-chat-";
 self.CIPOLATTI_CHAT_CACHE_NAME = `${self.CIPOLATTI_CHAT_CACHE_PREFIX}${self.CIPOLATTI_CHAT_SW_VERSION}`;
 console.info("CIPOLATTI service worker version:", self.CIPOLATTI_CHAT_SW_VERSION);
@@ -53,7 +53,13 @@ self.addEventListener("push", (event) => {
     requireInteraction: payload.requireInteraction === true,
     data,
   };
-  event.waitUntil(self.registration.showNotification(title, options));
+  const badgeCount = Number(payload.badgeCount ?? data.badgeCount ?? data.unreadCount ?? 0);
+  const badgeTask = Number.isFinite(badgeCount) && badgeCount > 0 && typeof self.registration.setAppBadge === "function"
+    ? self.registration.setAppBadge(badgeCount).catch(() => {})
+    : Number.isFinite(badgeCount) && badgeCount <= 0 && typeof self.registration.clearAppBadge === "function"
+      ? self.registration.clearAppBadge().catch(() => {})
+      : Promise.resolve();
+  event.waitUntil(Promise.all([badgeTask, self.registration.showNotification(title, options)]));
 });
 
 function notificationTargetUrl(data = {}) {
