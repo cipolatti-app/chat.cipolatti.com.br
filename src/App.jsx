@@ -1668,6 +1668,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   const pendingPrependScrollRef = useRef(null);
   const skipNextMessageScrollRef = useRef(false);
   const messageScrollModeRef = useRef("INITIAL_LOAD");
+  const prependOverflowAnchorRef = useRef(null);
   const prependRestoreFrameRef = useRef(0);
   const prependRestoreTimeoutRef = useRef(0);
   const fileDraft = fileDrafts[activeFileIndex] || null;
@@ -2253,11 +2254,18 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   };
   const scrollMessagesToBottom = (behavior = "auto") => {
     const container = messagesRef.current;
-    if (!container) return;
+    if (!container || messageScrollModeRef.current === "PREPEND_HISTORY" || pendingPrependScrollRef.current) return false;
     container.scrollTo({ top: container.scrollHeight, behavior });
     followLatestRef.current = true;
     setShowJumpLatest(false);
     setPendingLatestCount(0);
+    return true;
+  };
+  const releasePrependScrollLock = () => {
+    const container = messagesRef.current;
+    if (!container || prependOverflowAnchorRef.current === null) return;
+    container.style.overflowAnchor = prependOverflowAnchorRef.current;
+    prependOverflowAnchorRef.current = null;
   };
   const getVisibleMessageAnchor = () => {
     const container = messagesRef.current;
@@ -2291,6 +2299,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     if (pending.conversationId !== current?.id) {
       pendingPrependScrollRef.current = null;
       messageScrollModeRef.current = "INITIAL_LOAD";
+      releasePrependScrollLock();
       return;
     }
     restorePrependAnchor();
@@ -2310,6 +2319,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       restorePrependAnchor();
       pendingPrependScrollRef.current = null;
       messageScrollModeRef.current = "USER_SCROLL";
+      releasePrependScrollLock();
     }, 900);
     return () => {
       window.cancelAnimationFrame(prependRestoreFrameRef.current);
@@ -2333,7 +2343,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       return undefined;
     }
     const addedMessages = Math.max(0, messageCount - previousCount);
-    const shouldFollow = changedConversation || followLatestRef.current || isNearMessagesBottom();
+    const shouldFollow = changedConversation || (followLatestRef.current && messageScrollModeRef.current !== "PREPEND_HISTORY");
     let secondFrame;
     const frame = requestAnimationFrame(() => {
       if (shouldFollow) {
@@ -2356,11 +2366,11 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     const container = messagesRef.current;
     if (!container || !current?.id) return undefined;
     const observer = new ResizeObserver(() => {
-      if (messageScrollModeRef.current === "PREPEND_HISTORY") {
+      if (messageScrollModeRef.current === "PREPEND_HISTORY" || pendingPrependScrollRef.current) {
         restorePrependAnchor();
         return;
       }
-      if (followLatestRef.current || isNearMessagesBottom()) scrollMessagesToBottom("auto");
+      if (followLatestRef.current && messageScrollModeRef.current !== "USER_SCROLL") scrollMessagesToBottom("auto");
     });
     observer.observe(container);
     return () => observer.disconnect();
@@ -2667,6 +2677,12 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     const anchor = getVisibleMessageAnchor();
     if (!anchor) return;
     messageScrollModeRef.current = "PREPEND_HISTORY";
+    followLatestRef.current = false;
+    skipNextMessageScrollRef.current = true;
+    if (prependOverflowAnchorRef.current === null) {
+      prependOverflowAnchorRef.current = container.style.overflowAnchor;
+      container.style.overflowAnchor = "none";
+    }
     pendingPrependScrollRef.current = {
       conversationId: current.id,
       id: anchor.id,
@@ -2685,6 +2701,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     } catch (error) {
       pendingPrependScrollRef.current = null;
       messageScrollModeRef.current = "USER_SCROLL";
+      releasePrependScrollLock();
       console.warn("CIPOLATTI older history refresh failed", { conversationId: current.id, status: error.status || "", code: error.code || "" });
     } finally {
       loadingOlderMessagesRef.current = false;
@@ -3399,7 +3416,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     sessionStorage.removeItem("cipolatti-open-message-target");
     sessionStorage.removeItem("cipolatti-open-message-id");
     window.setTimeout(() => openMessageInConversation({ conversationId: current.id, messageId: requestedMessageId }), 160);
-  }, [internal, current?.id, current?.messages?.length]);
+  }, [internal, current?.id]);
 
   const moveSearchResult = (delta) => {
     if (!searchResults.length) return;

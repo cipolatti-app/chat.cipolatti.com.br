@@ -32,3 +32,12 @@ Detalhes operacionais e evidências permanecem em `docs/INCIDENTES.md`.
 - O cache de históricos no frontend foi limitado às conversas recentes e a 250 mensagens por conversa, preservando a conversa ativa.
 - Build e publicação validados na `.144`; bundle publicado: `index-BG42-xaf.js`.
 - Service Worker publicado: `20260921-lazy-history-sse-append-v1`.
+
+## 2026-09-21 — Correção estrutural do scroll ao inserir histórico
+
+- O prepend de páginas antigas passou a bloquear explicitamente qualquer caminho genérico de auto-scroll durante `PREPEND_HISTORY`.
+- O `ResizeObserver` e o efeito de mudança de mensagens deixaram de inferir autorização para ir ao final somente porque o usuário estava perto do rodapé.
+- O efeito de abertura da conversa não é mais rearmado a cada mudança de quantidade de mensagens.
+- O `overflow-anchor` nativo do container é suspenso somente durante o prepend, evitando disputa com a restauração da âncora DOM.
+- A paginação de 50 mensagens, o cursor `before`, SSE e o armazenamento do histórico não foram alterados.
+- Build e publicação validados na `.144`; bundle final: `index-BxG9d3gd.js`.

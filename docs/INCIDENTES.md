@@ -71,3 +71,21 @@ O componente `App` avaliava uma dependência inexistente em um `useEffect`:
 ### Validação
 
 Após a publicação, a interface renderizou visualmente no navegador e exibiu o formulário de login. O bundle novo retornou HTTP 200, o Service Worker foi versionado e o health local/público respondeu 200.
+
+## 2026-09-21 — Scroll retornando ao fim durante prepend de histórico
+
+### Causa confirmada
+
+O fluxo de histórico tinha a restauração de âncora, mas ainda havia dois caminhos concorrentes que podiam chamar `scrollMessagesToBottom`: o efeito de mensagens e o `ResizeObserver` usavam `isNearMessagesBottom()` como autorização implícita. Além disso, o efeito de abertura da conversa era rearmado quando `messages.length` mudava. Durante um prepend, esses caminhos podiam vencer a restauração da âncora e deslocar a viewport para baixo; o `overflow-anchor` nativo também podia competir com a compensação manual.
+
+### Correção aplicada
+
+- `PREPEND_HISTORY` agora desativa `followLatest` e bloqueia o auto-scroll centralizado.
+- A restauração usa a mensagem DOM âncora em múltiplos frames e suspende `overflow-anchor` somente enquanto o prepend está pendente.
+- `ResizeObserver` só acompanha o final quando existe intenção explícita de seguir mensagens novas; proximidade do rodapé não é mais suficiente.
+- O efeito de abertura depende da conversa, não da quantidade de mensagens carregadas.
+- O botão de novas mensagens continua sendo a ação explícita para voltar ao fim.
+
+### Validação
+
+Na produção `.144`, uma conversa longa foi aberta e navegada manualmente por páginas sucessivas, observando as transições de 50 para 100, 150 e 200 mensagens. O histórico continuou sendo inserido acima, sem retorno automático ao fim ou tela branca; o bundle final renderizou a lista, a conversa e o composer.
