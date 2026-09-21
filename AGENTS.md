@@ -26,6 +26,22 @@ build ou teste.
 - Antes de qualquer trabalho, consultar este arquivo, a documentação e os
   commits recentes para descobrir alterações feitas por Alexandre ou Wesley.
 
+### Repositórios GitHub
+
+- GitHub oficial compartilhado: `company` →
+  `https://github.com/cipolatti-app/chat.cipolatti.com.br`.
+- GitHub espelho secundário: `personal` →
+  `https://github.com/Alexandrekalion/connect_cipolatti_chat`.
+- O `company` é a fonte oficial para consulta e integração; o `personal`
+  recebe o mesmo commit somente depois do push confirmado no oficial.
+- O fluxo é: trabalho, validação, documentação, commit, push para `company`
+  e push do mesmo commit para `personal`.
+- Antes de trabalhar, executar `git fetch company`, consultar `AGENTS.md` e
+  `/docs`, e verificar commits novos de Alexandre ou Wesley.
+- Se `company` e `personal` divergirem, não sobrescrever, não usar force e
+  não resetar; registrar HEADs, commits e arquivos afetados antes de propor
+  a integração segura.
+
 - Criar backup antes de alterações de produção.
 - Não versionar banco, mensagens, uploads, backups, credenciais, tokens VAPID ou subscriptions.
 - Não alterar NAS, `.148` ou dados persistentes fora do escopo solicitado.
