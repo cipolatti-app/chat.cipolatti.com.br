@@ -23,16 +23,20 @@ function acceptKey(key) {
 
 function sendFrame(socket, payload) {
   if (socket.destroyed) return;
-  const body = Buffer.from(JSON.stringify(payload));
-  const header = [0x81];
-  if (body.length < 126) {
-    header.push(body.length);
-  } else if (body.length < 65536) {
-    header.push(126, (body.length >> 8) & 0xff, body.length & 0xff);
-  } else {
-    header.push(127, 0, 0, 0, 0, (body.length >> 24) & 0xff, (body.length >> 16) & 0xff, (body.length >> 8) & 0xff, body.length & 0xff);
+  try {
+    const body = Buffer.from(JSON.stringify(payload));
+    const header = [0x81];
+    if (body.length < 126) {
+      header.push(body.length);
+    } else if (body.length < 65536) {
+      header.push(126, (body.length >> 8) & 0xff, body.length & 0xff);
+    } else {
+      header.push(127, 0, 0, 0, 0, (body.length >> 24) & 0xff, (body.length >> 16) & 0xff, (body.length >> 8) & 0xff, body.length & 0xff);
+    }
+    socket.write(Buffer.concat([Buffer.from(header), body]));
+  } catch (error) {
+    socket.destroy(error);
   }
-  socket.write(Buffer.concat([Buffer.from(header), body]));
 }
 
 function closeFrame(socket) {
@@ -242,8 +246,6 @@ export async function handlePresenceUpgrade(request, socket, head) {
     };
     connections.set(connection.id, connection);
     lastKnownPresence.set(user.id, { status: "Online", lastSeenAt: user.lastSeenAt || "", signature: `Online|${user.lastSeenAt || ""}` });
-    sendFrame(socket, { type: "presence:snapshot", heartbeatMs: 30_000, awayAfterMs: AWAY_AFTER_MS, offlineAfterMs: HEARTBEAT_TIMEOUT_MS, users: await listPresenceForActor(user) });
-    broadcastPresence(publicPresenceForKnownUsers());
 
     socket.on("data", (chunk) => {
       try {
@@ -268,6 +270,9 @@ export async function handlePresenceUpgrade(request, socket, head) {
     socket.on("error", () => markDisconnected(connection));
     socket.on("close", () => markDisconnected(connection));
     socket.on("end", () => markDisconnected(connection));
+
+    sendFrame(socket, { type: "presence:snapshot", heartbeatMs: 30_000, awayAfterMs: AWAY_AFTER_MS, offlineAfterMs: HEARTBEAT_TIMEOUT_MS, users: await listPresenceForActor(user) });
+    broadcastPresence(publicPresenceForKnownUsers());
   } catch {
     rejectUpgrade(socket, 500, "Internal Server Error");
   }

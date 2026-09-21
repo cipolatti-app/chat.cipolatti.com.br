@@ -59,16 +59,25 @@ function registerInternalEventClient(request, response) {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
   });
-  response.write(`event: ready\ndata: ${JSON.stringify({ ok: true, at: new Date().toISOString() })}\n\n`);
   const clients = internalEventClients.get(userId) || new Set();
-  clients.add(response);
-  internalEventClients.set(userId, clients);
-  const keepAlive = setInterval(() => response.write(`: keepalive ${Date.now()}\n\n`), 25_000);
-  request.on("close", () => {
+  let keepAlive = null;
+  const close = () => {
     clearInterval(keepAlive);
     clients.delete(response);
     if (!clients.size) internalEventClients.delete(userId);
-  });
+  };
+  response.on("error", close);
+  response.write(`event: ready\ndata: ${JSON.stringify({ ok: true, at: new Date().toISOString() })}\n\n`);
+  clients.add(response);
+  internalEventClients.set(userId, clients);
+  keepAlive = setInterval(() => {
+    try {
+      response.write(`: keepalive ${Date.now()}\n\n`);
+    } catch {
+      close();
+    }
+  }, 25_000);
+  request.on("close", close);
 }
 
 function emitInternalEvent(userId, event, payload) {
@@ -94,14 +103,20 @@ function broadcastInternalConversation(data, conversationId, actorId, reason, ch
   for (const userId of participantIds) {
     const user = (data.users || []).find((item) => item.id === userId);
     if (!user) continue;
+    const changedMessageId = changedMessageIds[changedMessageIds.length - 1] || null;
+    const changedMessage = changedMessageId
+      ? (conversation.messages || []).find((message) => message.id === changedMessageId)
+      : null;
     emitInternalEvent(userId, "internal-conversation", {
       type: "internal-conversation",
+      eventType: reason === "messages" || reason === "audio" || reason === "files" ? "message.created" : `conversation.${reason}`,
       reason,
       actorId,
       conversationId,
       changedMessageIds,
       timing: { ...timing, broadcastAt },
-      conversation: internalConversationView(data, conversation, user),
+      conversationSummary: internalConversationSummary(data, conversation, user),
+      message: changedMessage ? internalMessageSummary(changedMessage) : null,
     });
   }
 }
@@ -1148,6 +1163,61 @@ function internalConversationView(data, conversation, actor = null) {
   };
 }
 
+function internalMessageSummary(message) {
+  if (!message) return null;
+  return {
+    id: message.id,
+    type: message.type || "message",
+    senderId: message.senderId || null,
+    sender: message.sender || "",
+    text: message.type === "audio" ? "Mensagem de audio" : message.type === "file" ? (message.file?.originalName || message.file?.name || "Arquivo anexado") : String(message.text || "").slice(0, 180),
+    createdAt: message.createdAt || "",
+    status: message.status || "sent",
+    role: message.role || "",
+    audio: message.audio || null,
+    file: message.file ? { name: message.file.name || "", originalName: message.file.originalName || "", mimeType: message.file.mimeType || "" } : null,
+    replyToMessageId: message.replyToMessageId || null,
+    forwardedFrom: message.forwardedFrom || null,
+    reactions: Array.isArray(message.reactions) ? message.reactions : [],
+  };
+}
+
+function internalConversationSummary(data, conversation, actor = null) {
+  ensureInternalShape(conversation);
+  const participants = (conversation.participantIds || []).map((id) => {
+    const user = data.users.find((item) => item.id === id);
+    return user ? publicDirectoryUser(user) : conversation.participantSnapshots?.[id];
+  }).filter(Boolean);
+  const lastMessage = [...(conversation.messages || [])].reverse().find((message) => !message.deletedAt) || null;
+  const memberRoles = Object.fromEntries(participants.map((user) => [user.id, groupRole(conversation, user.id)]));
+  return {
+    id: conversation.id,
+    type: conversation.type,
+    title: conversation.title || "",
+    description: conversation.description || "",
+    imageUrl: conversation.imageUrl || "",
+    department: conversation.department || "",
+    ownerId: conversation.ownerId || null,
+    owner: conversation.owner || "",
+    createdBy: conversation.createdBy || null,
+    adminIds: conversation.adminIds || [],
+    participantIds: conversation.participantIds || [],
+    participants: participants.map((user) => user.name),
+    participantUsers: participants.map((user) => ({ ...user, groupRole: memberRoles[user.id], groupRoleLabel: roleLabel(memberRoles[user.id]) })),
+    memberRoles,
+    currentUserGroupRole: actor ? groupRole(conversation, actor.id) : null,
+    messageSendMode: groupMessageSendMode(conversation),
+    canSendMessages: actor ? canSendInternalMessage(actor, conversation) : false,
+    participantCount: participants.length,
+    unreadCount: actor ? internalUnreadCount(conversation, actor) : 0,
+    readAt: actor ? conversation.readBy?.[actor.id] || null : null,
+    createdAt: conversation.createdAt || "",
+    updatedAt: conversation.updatedAt || conversation.lastMessageAt || "",
+    lastMessageAt: conversation.lastMessageAt || conversation.updatedAt || "",
+    lastMessage: internalMessageSummary(lastMessage),
+  };
+}
+
 function meetingView(data, meeting) {
   const participants = (meeting.participantIds || []).map((id) => {
     const user = data.users.find((item) => item.id === id);
@@ -1959,7 +2029,7 @@ async function handleApi(request, response, url) {
     const rows = data.internalConversations
       .filter((conversation) => canAccessInternalConversation(request.auth, conversation))
       .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
-      .map((conversation) => internalConversationView(data, conversation, request.auth));
+      .map((conversation) => internalConversationSummary(data, conversation, request.auth));
     return json(response, 200, rows);
   }
   if (url.pathname === "/api/internal/conversations" && request.method === "POST") {
@@ -2091,6 +2161,31 @@ async function handleApi(request, response, url) {
     const start = Math.max(0, index - 25);
     const end = Math.min(messages.length, index + 26);
     return json(response, 200, { conversationId: conversation.id, messageId: aroundMatch[2], messages: messages.slice(start, end), cursors: { before: start > 0 ? messages[start].id : null, after: end < messages.length ? messages[end - 1].id : null } });
+  }
+  const messageListMatch = url.pathname.match(/^\/api\/internal\/conversations\/([^/]+)\/messages$/);
+  if (messageListMatch && request.method === "GET") {
+    const data = await readStore();
+    const conversation = data.internalConversations.find((item) => item.id === messageListMatch[1]);
+    if (!conversation) return json(response, 404, { error: "Conversa interna não encontrada." });
+    if (!canAccessInternalConversation(request.auth, conversation)) {
+      auditDeniedConversationAccess(request, messageListMatch[1], "messages-list");
+      return json(response, 403, { error: "Sem permissão para esta conversa." });
+    }
+    const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 100);
+    const beforeId = url.searchParams.get("before") || "";
+    const messages = (conversation.messages || []).filter((message) => !message.deletedAt);
+    const end = beforeId ? Math.max(0, messages.findIndex((message) => message.id === beforeId)) : messages.length;
+    const safeEnd = beforeId && !messages.some((message) => message.id === beforeId) ? messages.length : end;
+    const start = Math.max(0, safeEnd - limit);
+    const hasMore = start > 0;
+    const nextCursor = hasMore ? messages[start].id : null;
+    return json(response, 200, {
+      conversationId: conversation.id,
+      messages: messages.slice(start, safeEnd),
+      nextCursor,
+      hasMore,
+      pagination: { limit, hasMoreBefore: hasMore, before: nextCursor },
+    });
   }
   const internalMatch = url.pathname.match(/^\/api\/internal\/conversations\/([^/]+)(?:\/(messages|audio|files|participants|send-policy|forward|close|read|react|edit))?$/);
   if (internalMatch && request.method === "GET" && !internalMatch[2]) {
@@ -2510,7 +2605,7 @@ async function handleApi(request, response, url) {
         });
       }
       pushJobs.forEach(dispatchPushJob);
-      if (internalMatch[2] === "read") return json(response, 200, { conversation: view, counts: buildUnreadCounts(data, request.auth) });
+      if (internalMatch[2] === "read") return json(response, 200, { conversation: internalConversationSummary(data, updated, request.auth), counts: buildUnreadCounts(data, request.auth) });
       if (internalMatch[2] === "messages") view.skippedDuplicateMessage = skippedDuplicateMessage;
       return json(response, ["messages", "audio", "files"].includes(internalMatch[2]) && !skippedDuplicateMessage ? 201 : 200, view);
     } catch (error) {

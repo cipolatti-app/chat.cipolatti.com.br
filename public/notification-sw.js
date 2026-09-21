@@ -1,4 +1,4 @@
-self.CIPOLATTI_CHAT_SW_VERSION = "20260914-realtime-read-compose-v1";
+self.CIPOLATTI_CHAT_SW_VERSION = "20260921-lazy-history-sse-append-v2";
 self.CIPOLATTI_CHAT_CACHE_PREFIX = "cipolatti-chat-";
 self.CIPOLATTI_CHAT_CACHE_NAME = `${self.CIPOLATTI_CHAT_CACHE_PREFIX}${self.CIPOLATTI_CHAT_SW_VERSION}`;
 console.info("CIPOLATTI service worker version:", self.CIPOLATTI_CHAT_SW_VERSION);

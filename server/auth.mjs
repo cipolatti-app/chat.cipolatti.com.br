@@ -171,19 +171,19 @@ function isVisibleOperationalUser(user) {
 }
 
 function adConfig() {
-  const baseDn = process.env.AD_BASE_DN || "";
+  const baseDn = process.env.AD_BASE_DN || "DC=cipodominio,DC=com,DC=br";
   return {
     enabled: process.env.AD_AUTH_ENABLED !== "false",
-    url: process.env.AD_LDAPS_URL || "",
+    url: process.env.AD_LDAPS_URL || "ldaps://ad-01.cipodominio.com.br",
     baseDn,
-    netbios: process.env.AD_NETBIOS || "",
-    domain: process.env.AD_DOMAIN || "",
-    serviceBindDn: process.env.AD_SERVICE_BIND_DN || "",
+    netbios: process.env.AD_NETBIOS || "CIPODOMINIO",
+    domain: process.env.AD_DOMAIN || "cipodominio.com.br",
+    serviceBindDn: process.env.AD_SERVICE_BIND_DN || `CN=Cipolatti Chat,OU=Contas de Servicos,${baseDn}`,
     servicePassword: process.env.AD_SERVICE_PASSWORD || "",
     groupDns: {
-      "Usuário": process.env.AD_GROUP_USUARIOS_DN || "",
-      Gestor: process.env.AD_GROUP_GESTORES_DN || "",
-      Administrador: process.env.AD_GROUP_ADMINISTRADORES_DN || "",
+      "Usuário": process.env.AD_GROUP_USUARIOS_DN || `CN=CIPOLATTI-CHAT-USUARIOS,OU=Cipolatti,${baseDn}`,
+      Gestor: process.env.AD_GROUP_GESTORES_DN || `CN=CIPOLATTI-CHAT-GESTORES,OU=Cipolatti,${baseDn}`,
+      Administrador: process.env.AD_GROUP_ADMINISTRADORES_DN || `CN=CIPOLATTI-CHAT-ADMINISTRADORES,OU=Cipolatti,${baseDn}`,
     },
   };
 }
@@ -381,7 +381,7 @@ async function loadActiveDirectoryUserByUsername(username) {
 
 function adUserSnapshot(entry, role) {
   const username = normalizeCredential(firstAttr(entry, "sAMAccountName"));
-  const email = normalizeCredential(firstAttr(entry, "mail") || firstAttr(entry, "userPrincipalName") || `${username}@${adConfig().domain || "example.local"}`);
+  const email = normalizeCredential(firstAttr(entry, "mail") || firstAttr(entry, "userPrincipalName") || `${username}@cipodominio.com.br`);
   const displayName = firstAttr(entry, "displayName") || username;
   const loginAliases = uniqueCredentials([email, username, firstAttr(entry, "userPrincipalName")])
     .filter((alias) => alias !== LOCAL_ADMIN_USERNAME);
@@ -525,6 +525,13 @@ function internalOrigins() {
   const values = [
     ...configured,
     envUrl(process.env.PUBLIC_BASE_URL),
+    "https://chat.cipolatti.com.br",
+    "http://chat.cipolatti.com.br",
+    "https://192.168.0.144",
+    "http://192.168.0.144",
+    "https://connect.cipolatti.com.br",
+    "https://192.168.0.148",
+    "http://192.168.0.148",
   ];
   return new Set(values.filter(Boolean));
 }

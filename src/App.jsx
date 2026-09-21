@@ -17,7 +17,7 @@ import { activity, chartData, contacts, departments, users } from "./data";
 const BRAND_NAME = "CIPOLATTI";
 const BRAND_SUBTITLE = "Central de Atendimento Corporativo";
 const BRAND_ICON = `${import.meta.env.BASE_URL}cipolatti-icon.png`;
-const FRONTEND_BUILD_VERSION = "2026.09.14.1";
+const FRONTEND_BUILD_VERSION = "2026.09.21.4";
 const DEFAULT_API_TIMEOUT_MS = 15000;
 const LOGIN_API_TIMEOUT_MS = 15000;
 const appLifecycle = { hiddenAt: 0, resumedAt: Date.now() };
@@ -877,7 +877,8 @@ function mapCloudConversation(conversation) {
 }
 
 function mapInternalConversation(conversation, currentUser) {
-  const lastMessage = conversation.messages?.at(-1);
+  const loadedMessages = Array.isArray(conversation.messages) ? conversation.messages : [];
+  const lastMessage = conversation.lastMessage || loadedMessages.at(-1);
   const isGroup = conversation.type === "group";
   const otherUser = conversation.participantUsers?.find((user) => user.id !== currentUser?.id);
   const title = isGroup
@@ -901,7 +902,7 @@ function mapInternalConversation(conversation, currentUser) {
     unread: Number(conversation.unreadCount || 0),
     time: conversation.updatedAt ? new Date(conversation.updatedAt).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) : "",
     preview: lastMessage?.type === "audio" ? "Mensagem de audio" : lastMessage?.type === "file" ? lastMessage.file?.originalName || lastMessage.file?.name || "Arquivo anexado" : lastMessage?.text || "Conversa interna",
-    messages: (conversation.messages || []).map((message) => ({
+    messages: loadedMessages.map((message) => ({
       id: message.id,
       type: message.type === "system" ? "system" : message.type === "audio" ? "audio" : message.type === "file" ? "file" : "message",
       side: message.senderId === currentUser?.id ? "out" : "in",
@@ -937,6 +938,20 @@ function notificationIcon(type = "") {
   if (String(type).includes("group")) return <Users size={16}/>;
   if (String(type).includes("message")) return <MessageCircle size={16}/>;
   return <Bell size={16}/>;
+}
+
+function pruneInternalMessageCache(items, activeId, maxConversations = 5, maxMessages = 250) {
+  const loaded = items
+    .filter((item) => Array.isArray(item.messages) && item.messages.length)
+    .sort((a, b) => (a.id === activeId ? -1 : b.id === activeId ? 1 : new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0)));
+  const keepIds = new Set([activeId, ...loaded.slice(0, maxConversations - 1).map((item) => item.id)]);
+  let keptMessages = 0;
+  return items.map((item) => {
+    if (item.id === activeId) return item;
+    if (!keepIds.has(item.id) || keptMessages >= maxMessages) return { ...item, messages: [] };
+    keptMessages += item.messages?.length || 0;
+    return item;
+  });
 }
 
 function formatNotificationTime(value) {
@@ -1206,7 +1221,7 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
     refresh();
     const onRefresh = () => refresh();
     window.addEventListener("kalion-unread-refresh", onRefresh);
-    const timer = window.setInterval(refresh, 10000);
+    const timer = window.setInterval(refresh, 30000);
     return () => {
       active = false;
       window.removeEventListener("kalion-unread-refresh", onRefresh);
@@ -1345,8 +1360,38 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
         // The topbar already keeps the UI usable if the polling endpoint is unavailable.
       }
     };
-    pollMessages();
-    const timer = window.setInterval(pollMessages, 8000);
+    const onRealtimeMessage = (event) => {
+      const payload = event?.detail || {};
+      const message = payload.message;
+      const summary = payload.conversationSummary || payload.conversation;
+      if (!message?.id || !summary?.id || message.senderId === currentUser.id || message.type === "system") return;
+      const preferences = notificationPreferences(currentUser);
+      const isGroup = summary.type === "group";
+      if ((isGroup && !preferences.groups) || (!isGroup && !preferences.direct)) return;
+      const alertInfo = {
+        id: message.id,
+        conversationId: summary.id,
+        isGroup,
+        groupTitle: isGroup ? summary.title || "Grupo interno" : "",
+        sender: message.sender || summary.title || "CIPOLATTI",
+        title: isGroup ? `Nova mensagem em ${summary.title || "Grupo interno"}` : `Nova mensagem de ${message.sender || summary.title || "CIPOLATTI"}`,
+        preview: messageNotificationPreview(message, preferences.showContent),
+        messageCreatedAt: message.createdAt || "",
+        notificationSource: "sse",
+      };
+      pendingMessageAlertsRef.current.set(message.id, alertInfo);
+      if (notifiedMessagesRef.current.has(message.id)) return;
+      notifiedMessagesRef.current.add(message.id);
+      if (!preferences.enabled || preferences.doNotDisturb) return;
+      const activeConversationId = sessionStorage.getItem("cipolatti-active-conversation-id") || "";
+      if (activeConversationId === summary.id && document.visibilityState === "visible" && document.hasFocus()) return;
+      setMessageBanner({ ...alertInfo, visible: true });
+      if (preferences.sound && audioUnlockedRef.current && Date.now() - lastNotificationSoundRef.current > 15000) {
+        lastNotificationSoundRef.current = Date.now();
+        playNotificationTone();
+      }
+    };
+    window.addEventListener("cipolatti-internal-message", onRealtimeMessage);
     const repeatTimer = window.setInterval(() => {
       const preferences = notificationPreferences(currentUser);
       if (!preferences.enabled || !preferences.persistent || preferences.doNotDisturb) return;
@@ -1377,7 +1422,7 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
     }, 60000);
     return () => {
       active = false;
-      window.clearInterval(timer);
+      window.removeEventListener("cipolatti-internal-message", onRealtimeMessage);
       window.clearInterval(repeatTimer);
     };
   }, [currentUser.id, currentUser.preferences, setPage]);
@@ -1442,7 +1487,7 @@ function Topbar({ page, setPage, setMobileOpen, currentUser, theme, setTheme, on
       }
     };
     pollNotifications();
-    const timer = window.setInterval(pollNotifications, 10000);
+    const timer = window.setInterval(pollNotifications, 30000);
     return () => {
       active = false;
       window.clearInterval(timer);
@@ -1618,6 +1663,13 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   const audioDiscardRef = useRef(false);
   const collaboratorsErrorNotifiedRef = useRef(false);
   const selectedIdRef = useRef(null);
+  const messagesBeforeRef = useRef(null);
+  const loadingOlderMessagesRef = useRef(false);
+  const pendingPrependScrollRef = useRef(null);
+  const skipNextMessageScrollRef = useRef(false);
+  const messageScrollModeRef = useRef("INITIAL_LOAD");
+  const prependRestoreFrameRef = useRef(0);
+  const prependRestoreTimeoutRef = useRef(0);
   const fileDraft = fileDrafts[activeFileIndex] || null;
   const draftStorageKey = currentUser?.id ? `cipolatti_chat_drafts_${currentUser.id}` : "";
   const isAdmin = currentUser.role === "Administrador";
@@ -1696,6 +1748,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     let socket = null;
     let reconnectTimer = 0;
     let heartbeatTimer = 0;
+    let reconnectDelay = 1000;
     let closed = false;
     let lastActivitySent = 0;
     let lastConnectedAt = 0;
@@ -1723,6 +1776,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       window.clearInterval(heartbeatTimer);
       socket = new WebSocket(websocketApiUrl("/api/presence"));
       socket.onopen = () => {
+        reconnectDelay = 1000;
         lastConnectedAt = Date.now();
         markSelfOnline();
         sendPresence("presence:activity");
@@ -1737,7 +1791,10 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       };
       socket.onclose = () => {
         window.clearInterval(heartbeatTimer);
-        if (!closed) reconnectTimer = window.setTimeout(connect, 5000);
+        if (!closed) {
+          reconnectTimer = window.setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+        }
       };
       socket.onerror = () => socket?.close();
     };
@@ -1756,6 +1813,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
         apiRequest("/api/presence", { allowDuringResume: true, timeoutMs: 10000 }).then(mergePresenceRows).catch(() => {});
         return;
       }
+      if (socket?.readyState === WebSocket.CONNECTING) return;
       window.clearTimeout(reconnectTimer);
       connect();
     };
@@ -1954,7 +2012,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     let refreshTimer = 0;
     let refreshInFlight = false;
     let pendingRefresh = null;
-    const scheduleRefresh = (delay = 3000) => {
+    const scheduleRefresh = (delay = 120000) => {
       window.clearTimeout(refreshTimer);
       if (!active) return;
       refreshTimer = window.setTimeout(refresh, delay);
@@ -1977,19 +2035,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
         const requestOptions = forceResume ? { allowDuringResume: true, timeoutMs: 20000 } : {};
         const conversationRows = await apiRequest("/api/internal/conversations", requestOptions);
         if (!active) return;
-        let mapped = conversationRows.map((conversation) => mapInternalConversation(conversation, currentUser));
-        if (targetConversationId) {
-          try {
-            const detail = await apiRequest(`/api/internal/conversations/${targetConversationId}`, requestOptions);
-            const mappedDetail = mapInternalConversation(detail, currentUser);
-            mapped = mapped.some((conversation) => conversation.id === mappedDetail.id)
-              ? mapped.map((conversation) => conversation.id === mappedDetail.id ? mappedDetail : conversation)
-              : [mappedDetail, ...mapped];
-            console.info("CIPOLATTI resume sync: active conversation refreshed", { conversationId: targetConversationId });
-          } catch (error) {
-            if (forceResume) console.warn("CIPOLATTI resume sync: active conversation refresh failed", { status: error.status || "", code: error.code || "" });
-          }
-        }
+        const mapped = conversationRows.map((conversation) => mapInternalConversation(conversation, currentUser));
         setConversations(mapped);
         const scoped = groupOnly ? mapped.filter((item) => item.type === "group") : mapped;
         setSelectedId((value) => value && scoped.some((item) => item.id === value) ? value : null);
@@ -2017,7 +2063,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
           refresh(next);
           return;
         }
-        scheduleRefresh(3000);
+        scheduleRefresh(120000);
       }
     };
     const resumeRefresh = (event) => {
@@ -2047,23 +2093,27 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     if (!internal || typeof EventSource === "undefined") return undefined;
     let source = null;
     let reconnectTimer = 0;
+    let reconnectDelay = 1000;
     let closed = false;
     const connect = () => {
       if (closed || document.hidden) return;
       source = new EventSource(apiUrl("/api/internal/events"), { withCredentials: true });
+      source.onopen = () => { reconnectDelay = 1000; };
       source.addEventListener("internal-conversation", (event) => {
         try {
           const payload = JSON.parse(event.data || "{}");
-          if (!payload.conversation?.id) return;
-          const mapped = mapInternalConversation(payload.conversation, currentUser);
+          const summary = payload.conversationSummary || payload.conversation;
+          if (!summary?.id) return;
+          const mapped = mapInternalConversation(summary, currentUser);
           setConversations((items) => {
-            const next = [mapped, ...items.filter((item) => item.id !== mapped.id)];
+            const existing = items.find((item) => item.id === mapped.id);
+            const merged = existing ? mapInternalConversation({ ...summary, messages: existing.messages || [] }, currentUser) : mapped;
+            const next = [merged, ...items.filter((item) => item.id !== mapped.id)];
             return next.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
           });
-          const activeConversationId = selectedIdRef.current || "";
-          if (payload.timing && (activeConversationId === mapped.id || payload.changedMessageIds?.length)) {
+          if (payload.timing) {
             console.info("CIPOLATTI realtime message", {
-              conversationId: mapped.id,
+              conversationId: summary.id,
               changedMessageIds: payload.changedMessageIds || [],
               requestStartedAt: payload.timing.requestStartedAt || "",
               backendPersistedAt: payload.timing.backendPersistedAt || "",
@@ -2071,6 +2121,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
               clientReceivedAt: new Date().toISOString(),
             });
           }
+          window.dispatchEvent(new CustomEvent("cipolatti-internal-message", { detail: payload }));
           window.dispatchEvent(new CustomEvent("kalion-unread-refresh"));
         } catch (error) {
           console.warn("CIPOLATTI realtime message: invalid event", { error: error.message || String(error) });
@@ -2078,7 +2129,10 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       });
       source.onerror = () => {
         source?.close();
-        if (!closed) reconnectTimer = window.setTimeout(connect, 5000);
+        if (!closed) {
+          reconnectTimer = window.setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+        }
       };
     };
     const resume = () => {
@@ -2108,6 +2162,54 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
   }, [internal, currentUser.id]);
 
   useEffect(() => {
+    if (!internal || !current?.id || current.source !== "internal-api") return undefined;
+    let active = true;
+    let inFlight = false;
+    const loadMessages = async () => {
+      if (document.hidden || inFlight) return;
+      inFlight = true;
+      try {
+        const result = await apiRequest(`/api/internal/conversations/${encodeURIComponent(current.id)}/messages?limit=50`, { allowDuringResume: true, timeoutMs: 20000 });
+        if (!active) return;
+        setConversations((items) => pruneInternalMessageCache(items.map((item) => item.id === current.id
+          ? mapInternalConversation({ ...item, messages: result.messages || [] }, currentUser)
+          : item), current.id));
+        messagesBeforeRef.current = result.nextCursor || result.pagination?.before || null;
+        console.info("CIPOLATTI conversation history refreshed", { conversationId: current.id, messageCount: (result.messages || []).length });
+      } catch (error) {
+        if (active) console.warn("CIPOLATTI conversation history refresh failed", { conversationId: current.id, status: error.status || "", code: error.code || "" });
+      } finally {
+        inFlight = false;
+      }
+    };
+    loadMessages();
+    const onResume = () => loadMessages();
+    const onMessage = (event) => {
+      const payload = event?.detail || {};
+      const message = payload.message;
+      if (payload.conversationId !== current.id || !message?.id) return;
+      setConversations((items) => pruneInternalMessageCache(items.map((item) => {
+        if (item.id !== current.id) return item;
+        const known = new Set((item.messages || []).map((entry) => entry.id));
+        if (known.has(message.id)) return item;
+        return mapInternalConversation({
+          ...item,
+          ...(payload.conversationSummary || {}),
+          messages: [...(item.messages || []), message].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)),
+        }, currentUser);
+      }), current.id));
+      console.info("CIPOLATTI realtime message appended", { conversationId: current.id, messageId: message.id });
+    };
+    window.addEventListener("cipolatti-app-resume", onResume);
+    window.addEventListener("cipolatti-internal-message", onMessage);
+    return () => {
+      active = false;
+      window.removeEventListener("cipolatti-app-resume", onResume);
+      window.removeEventListener("cipolatti-internal-message", onMessage);
+    };
+  }, [internal, current?.id, currentUser.id]);
+
+  useEffect(() => {
     if (!internal || !current?.id || current.source !== "internal-api" || document.hidden) return;
     const readKey = `${current.id}:${current.updatedAt || ""}:${current.messages?.length || 0}`;
     if (readConversationKeyRef.current === readKey) return;
@@ -2117,7 +2219,9 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       .then((result) => {
         if (!active) return;
         if (result.conversation) {
-          setConversations((items) => items.map((item) => item.id === current.id ? mapInternalConversation(result.conversation, currentUser) : item));
+          setConversations((items) => items.map((item) => item.id === current.id
+            ? mapInternalConversation({ ...item, ...result.conversation, messages: item.messages || [] }, currentUser)
+            : item));
         }
         window.dispatchEvent(new CustomEvent("kalion-unread-refresh"));
       })
@@ -2155,6 +2259,63 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     setShowJumpLatest(false);
     setPendingLatestCount(0);
   };
+  const getVisibleMessageAnchor = () => {
+    const container = messagesRef.current;
+    if (!container) return null;
+    const containerRect = container.getBoundingClientRect();
+    const node = [...container.querySelectorAll("[data-message-id]")].find((item) => {
+      const rect = item.getBoundingClientRect();
+      return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
+    });
+    if (!node) return null;
+    const rect = node.getBoundingClientRect();
+    return { id: node.getAttribute("data-message-id"), offset: rect.top - containerRect.top };
+  };
+  const restorePrependAnchor = () => {
+    const pending = pendingPrependScrollRef.current;
+    const container = messagesRef.current;
+    if (!pending || !container || pending.conversationId !== current?.id) return false;
+    const safeId = window.CSS?.escape ? CSS.escape(String(pending.id)) : String(pending.id).replace(/"/g, "");
+    const node = container.querySelector(`[data-message-id="${safeId}"]`);
+    if (!node) return false;
+    const containerRect = container.getBoundingClientRect();
+    const nodeRect = node.getBoundingClientRect();
+    const delta = nodeRect.top - containerRect.top - pending.offset;
+    if (Math.abs(delta) > 0.5) container.scrollTop += delta;
+    return true;
+  };
+  useLayoutEffect(() => {
+    const pending = pendingPrependScrollRef.current;
+    const container = messagesRef.current;
+    if (!pending || !container) return;
+    if (pending.conversationId !== current?.id) {
+      pendingPrependScrollRef.current = null;
+      messageScrollModeRef.current = "INITIAL_LOAD";
+      return;
+    }
+    restorePrependAnchor();
+    followLatestRef.current = false;
+    skipNextMessageScrollRef.current = true;
+    window.cancelAnimationFrame(prependRestoreFrameRef.current);
+    window.clearTimeout(prependRestoreTimeoutRef.current);
+    let frames = 0;
+    const restoreFrames = () => {
+      if (messageScrollModeRef.current !== "PREPEND_HISTORY" || !pendingPrependScrollRef.current) return;
+      restorePrependAnchor();
+      frames += 1;
+      if (frames < 5) prependRestoreFrameRef.current = window.requestAnimationFrame(restoreFrames);
+    };
+    prependRestoreFrameRef.current = window.requestAnimationFrame(restoreFrames);
+    prependRestoreTimeoutRef.current = window.setTimeout(() => {
+      restorePrependAnchor();
+      pendingPrependScrollRef.current = null;
+      messageScrollModeRef.current = "USER_SCROLL";
+    }, 900);
+    return () => {
+      window.cancelAnimationFrame(prependRestoreFrameRef.current);
+      window.clearTimeout(prependRestoreTimeoutRef.current);
+    };
+  }, [current?.id, current?.messages?.length]);
   useEffect(() => {
     const messageCount = current?.messages?.length || 0;
     const changedConversation = previousSelectedRef.current !== selectedId;
@@ -2166,6 +2327,11 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       setPendingLatestCount(0);
       return undefined;
     }
+    if (messageScrollModeRef.current === "PREPEND_HISTORY" || pendingPrependScrollRef.current) return undefined;
+    if (skipNextMessageScrollRef.current && !changedConversation) {
+      skipNextMessageScrollRef.current = false;
+      return undefined;
+    }
     const addedMessages = Math.max(0, messageCount - previousCount);
     const shouldFollow = changedConversation || followLatestRef.current || isNearMessagesBottom();
     let secondFrame;
@@ -2173,9 +2339,11 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       if (shouldFollow) {
         scrollMessagesToBottom(changedConversation ? "auto" : "smooth");
         secondFrame = requestAnimationFrame(() => scrollMessagesToBottom("auto"));
+        messageScrollModeRef.current = "USER_SCROLL";
       } else if (addedMessages > 0) {
         setPendingLatestCount((count) => Math.min(99, count + addedMessages));
         setShowJumpLatest(true);
+        messageScrollModeRef.current = "USER_SCROLL";
       }
     });
     return () => {
@@ -2188,6 +2356,10 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     const container = messagesRef.current;
     if (!container || !current?.id) return undefined;
     const observer = new ResizeObserver(() => {
+      if (messageScrollModeRef.current === "PREPEND_HISTORY") {
+        restorePrependAnchor();
+        return;
+      }
       if (followLatestRef.current || isNearMessagesBottom()) scrollMessagesToBottom("auto");
     });
     observer.observe(container);
@@ -2488,6 +2660,35 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     setRecordingAudio(false);
     setAudioSending(false);
     setRecordingElapsedSeconds(0);
+  };
+  const loadOlderMessages = async () => {
+    if (!current?.id || !messagesBeforeRef.current || loadingOlderMessagesRef.current) return;
+    const container = messagesRef.current;
+    const anchor = getVisibleMessageAnchor();
+    if (!anchor) return;
+    messageScrollModeRef.current = "PREPEND_HISTORY";
+    pendingPrependScrollRef.current = {
+      conversationId: current.id,
+      id: anchor.id,
+      offset: anchor.offset,
+    };
+    loadingOlderMessagesRef.current = true;
+    try {
+      const result = await apiRequest(`/api/internal/conversations/${encodeURIComponent(current.id)}/messages?limit=50&before=${encodeURIComponent(messagesBeforeRef.current)}`, { allowDuringResume: true, timeoutMs: 20000 });
+      const older = result.messages || [];
+      setConversations((items) => pruneInternalMessageCache(items.map((item) => {
+        if (item.id !== current.id) return item;
+        const known = new Set((item.messages || []).map((message) => message.id));
+        return mapInternalConversation({ ...item, messages: [...older.filter((message) => !known.has(message.id)), ...(item.messages || [])] }, currentUser);
+      }), current.id));
+      messagesBeforeRef.current = result.nextCursor || result.pagination?.before || null;
+    } catch (error) {
+      pendingPrependScrollRef.current = null;
+      messageScrollModeRef.current = "USER_SCROLL";
+      console.warn("CIPOLATTI older history refresh failed", { conversationId: current.id, status: error.status || "", code: error.code || "" });
+    } finally {
+      loadingOlderMessagesRef.current = false;
+    }
   };
   const sendAudioDraft = async () => {
     if (!audioDraft || !current?.id || audioSending) return;
@@ -3331,7 +3532,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
           <p>Participantes: {current.participants.join(", ")}</p>
           {current.transferred && <Status>Transferido</Status>}
         </div>}
-        <div className="messages" ref={messagesRef} data-testid="messages-scroll" onScroll={() => { const nearBottom = isNearMessagesBottom(); followLatestRef.current = nearBottom; setShowJumpLatest(!nearBottom); if (nearBottom) setPendingLatestCount(0); }}>
+        <div className="messages" ref={messagesRef} data-testid="messages-scroll" onScroll={(event) => { if (messageScrollModeRef.current === "PREPEND_HISTORY") return; messageScrollModeRef.current = "USER_SCROLL"; const nearBottom = isNearMessagesBottom(); followLatestRef.current = nearBottom; setShowJumpLatest(!nearBottom); if (nearBottom) setPendingLatestCount(0); if (event.currentTarget.scrollTop < 80) loadOlderMessages(); }}>
           {dragActive && <div className="drop-overlay"><Paperclip size={22}/><span>Solte o arquivo para anexar</span></div>}
           {renderedMessageNodes}
         </div>
@@ -3850,6 +4051,27 @@ function AlbumAttachment({ files = [], caption = "" }) {
       {images.length > 1 && <button type="button" className="album-viewer-nav next" onClick={() => move(1)}><ChevronRight size={24}/></button>}
     </div>}
   </div>;
+}
+
+class GlobalErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error, info) {
+    console.error("CIPOLATTI global UI error", {
+      name: error?.name || "Error",
+      message: error?.message || "Erro de renderização",
+      componentStack: info?.componentStack || "",
+    });
+  }
+  render() {
+    if (!this.state.hasError) return this.props.children;
+    return <div className="content-page"><article className="panel error-panel"><AlertTriangle/><div><h1>O Chat encontrou um erro ao carregar.</h1><p>Tente atualizar a aplicação.</p></div><button className="primary-button" type="button" onClick={() => window.location.reload()}>Recarregar Chat</button></article></div>;
+  }
 }
 
 function getInitialContextMenuStyle(margin = 10) {
@@ -5935,12 +6157,13 @@ function ChangePasswordScreen({ account, onChanged, onLogout }) {
   return <div className="login-screen"><main className="login-panel password-change"><div className="login-heading"><span><KeyRound/></span><div><h1>Crie uma nova senha</h1><p>Este acesso utiliza uma senha temporária e precisa ser atualizado.</p></div></div><form onSubmit={save}>{!account.mustChangePassword&&<label><span>Senha atual</span><input type="password" value={currentPassword} onChange={(event)=>setCurrentPassword(event.target.value)}/></label>}<label><span>Nova senha</span><input type="password" value={password} onChange={(event)=>setPassword(event.target.value)}/></label><label><span>Confirmar nova senha</span><input type="password" value={confirm} onChange={(event)=>setConfirm(event.target.value)}/></label>{message&&<div className="login-message">{message}</div>}<button className="primary-button login-submit">Atualizar senha</button><button type="button" className="login-link" onClick={onLogout}>Cancelar e sair</button></form></main></div>;
 }
 
-function PresenceKeeper({ currentUser }) {
+function PresenceKeeper({ currentUser, enabled = true }) {
   useEffect(() => {
-    if (!currentUser?.id) return undefined;
+    if (!enabled || !currentUser?.id) return undefined;
     let socket = null;
     let reconnectTimer = 0;
     let heartbeatTimer = 0;
+    let reconnectDelay = 1000;
     let closed = false;
     let lastActivitySent = 0;
     let lastConnectedAt = 0;
@@ -5959,6 +6182,7 @@ function PresenceKeeper({ currentUser }) {
       window.clearInterval(heartbeatTimer);
       socket = new WebSocket(websocketApiUrl("/api/presence"));
       socket.onopen = () => {
+        reconnectDelay = 1000;
         lastConnectedAt = Date.now();
         sendPresence("presence:activity");
         window.clearInterval(heartbeatTimer);
@@ -5966,7 +6190,10 @@ function PresenceKeeper({ currentUser }) {
       };
       socket.onclose = () => {
         window.clearInterval(heartbeatTimer);
-        if (!closed) reconnectTimer = window.setTimeout(connect, 5000);
+        if (!closed) {
+          reconnectTimer = window.setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+        }
       };
       socket.onerror = () => socket?.close();
     };
@@ -5983,6 +6210,7 @@ function PresenceKeeper({ currentUser }) {
         sendPresence("presence:activity");
         return;
       }
+      if (socket?.readyState === WebSocket.CONNECTING) return;
       window.clearTimeout(reconnectTimer);
       connect();
     };
@@ -6247,7 +6475,7 @@ function App() {
     : "default";
   return (
     <div className="app-shell" data-theme={theme} data-message-font-size={messageFontSize}>
-      <PresenceKeeper currentUser={currentUser} />
+      <PresenceKeeper currentUser={currentUser} enabled={!['conversas', 'grupos'].includes(page)} />
       {serviceWorkerUpdate && <div className="pwa-update-banner" role="status" aria-live="polite"><div><strong>Nova versão disponível</strong><span>O Chat | Cipolatti foi atualizado.</span></div><button type="button" className="primary-button" onClick={applyServiceWorkerUpdate}>Atualizar agora</button><button type="button" className="icon-button" aria-label="Ocultar atualização" onClick={() => setServiceWorkerUpdate(null)}><X size={16}/></button></div>}
       {pushActivationPrompt && <PushActivationModal currentUser={currentUser} mode={pushActivationPrompt.mode} onClose={closePushActivationPrompt} onCurrentUserUpdated={setCurrentUser}/>}
       <Sidebar page={page} setPage={setPage} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} currentUser={currentUser} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} />
@@ -6259,7 +6487,11 @@ function App() {
   );
 }
 
-export default App;
+function AppWithGlobalErrorBoundary() {
+  return <GlobalErrorBoundary><App /></GlobalErrorBoundary>;
+}
+
+export default AppWithGlobalErrorBoundary;
 
 
 
