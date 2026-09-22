@@ -17,7 +17,7 @@ import { activity, chartData, contacts, departments, users } from "./data";
 const BRAND_NAME = "CIPOLATTI";
 const BRAND_SUBTITLE = "Central de Atendimento Corporativo";
 const BRAND_ICON = `${import.meta.env.BASE_URL}cipolatti-icon.png`;
-const FRONTEND_BUILD_VERSION = "2026.09.21.4";
+const FRONTEND_BUILD_VERSION = "2026.09.22.1";
 const DEFAULT_API_TIMEOUT_MS = 15000;
 const LOGIN_API_TIMEOUT_MS = 15000;
 const appLifecycle = { hiddenAt: 0, resumedAt: Date.now() };
@@ -952,6 +952,17 @@ function pruneInternalMessageCache(items, activeId, maxConversations = 5, maxMes
     keptMessages += item.messages?.length || 0;
     return item;
   });
+}
+
+function mergeInternalMessages(existingMessages = [], incomingMessages = []) {
+  const merged = new Map();
+  for (const message of existingMessages) {
+    if (message?.id) merged.set(message.id, message);
+  }
+  for (const message of incomingMessages) {
+    if (message?.id && !merged.has(message.id)) merged.set(message.id, message);
+  }
+  return [...merged.values()].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
 }
 
 function formatNotificationTime(value) {
@@ -2037,7 +2048,16 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
         const conversationRows = await apiRequest("/api/internal/conversations", requestOptions);
         if (!active) return;
         const mapped = conversationRows.map((conversation) => mapInternalConversation(conversation, currentUser));
-        setConversations(mapped);
+        setConversations((previous) => {
+          const previousById = new Map(previous.map((item) => [item.id, item]));
+          const reconciled = mapped.map((item) => {
+            const existing = previousById.get(item.id);
+            return existing && Array.isArray(existing.messages)
+              ? mapInternalConversation({ ...item, messages: existing.messages }, currentUser)
+              : item;
+          });
+          return pruneInternalMessageCache(reconciled, selectedIdRef.current);
+        });
         const scoped = groupOnly ? mapped.filter((item) => item.type === "group") : mapped;
         setSelectedId((value) => value && scoped.some((item) => item.id === value) ? value : null);
         window.dispatchEvent(new CustomEvent("kalion-unread-refresh"));
@@ -2173,7 +2193,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
         const result = await apiRequest(`/api/internal/conversations/${encodeURIComponent(current.id)}/messages?limit=50`, { allowDuringResume: true, timeoutMs: 20000 });
         if (!active) return;
         setConversations((items) => pruneInternalMessageCache(items.map((item) => item.id === current.id
-          ? mapInternalConversation({ ...item, messages: result.messages || [] }, currentUser)
+          ? mapInternalConversation({ ...item, messages: mergeInternalMessages(item.messages, result.messages || []) }, currentUser)
           : item), current.id));
         messagesBeforeRef.current = result.nextCursor || result.pagination?.before || null;
         console.info("CIPOLATTI conversation history refreshed", { conversationId: current.id, messageCount: (result.messages || []).length });

@@ -41,3 +41,10 @@ Detalhes operacionais e evidências permanecem em `docs/INCIDENTES.md`.
 - O `overflow-anchor` nativo do container é suspenso somente durante o prepend, evitando disputa com a restauração da âncora DOM.
 - A paginação de 50 mensagens, o cursor `before`, SSE e o armazenamento do histórico não foram alterados.
 - Build e publicação validados na `.144`; bundle final: `index-BxG9d3gd.js`.
+## 2026-09-22 — Reconciliação do estado de mensagens
+
+- Corrigida uma condição de corrida em que a reconciliação de resumos substituía a lista inteira de conversas e removia do estado React o histórico já carregado.
+- O carregamento inicial das últimas 50 mensagens agora faz merge por `messageId`, preservando mensagens recebidas via SSE enquanto a requisição estava pendente.
+- A reconciliação de conversas preserva os históricos carregados localmente e continua usando a política de cache existente.
+- Não houve alteração no banco, na persistência, no SSE, no cursor de paginação ou na quantidade de mensagens por página.
+- Frontend: `2026.09.22.1`; Service Worker: `20260922-message-state-reconciliation-v1`.

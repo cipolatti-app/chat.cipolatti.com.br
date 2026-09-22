@@ -89,3 +89,26 @@ O fluxo de histórico tinha a restauração de âncora, mas ainda havia dois cam
 ### Validação
 
 Na produção `.144`, uma conversa longa foi aberta e navegada manualmente por páginas sucessivas, observando as transições de 50 para 100, 150 e 200 mensagens. O histórico continuou sendo inserido acima, sem retorno automático ao fim ou tela branca; o bundle final renderizou a lista, a conversa e o composer.
+## 2026-09-22 — Mensagens persistidas desaparecendo temporariamente da interface
+
+### Sintoma
+
+Mensagens permaneciam persistidas, mas desapareciam da conversa até uma reconexão ou atualização do PWA.
+
+### Causa confirmada
+
+O refresh periódico/retomada chamava `setConversations(mapped)` com resumos que não continham `messages`, substituindo o histórico carregado no estado React. Havia também uma corrida no carregamento inicial: um evento SSE podia acrescentar uma mensagem enquanto o GET das últimas 50 mensagens estava pendente; quando o GET terminava, seu resultado antigo substituía a mensagem recebida.
+
+### Correção aplicada
+
+- Reconciliação de resumos preserva `messages` já carregadas por conversa.
+- O carregamento de histórico faz união por `messageId` e ordena por `createdAt`, em vez de substituir o array.
+- A paginação, o SSE, a persistência e o comportamento de scroll não foram alterados.
+
+### Validação
+
+- Build fora da produção concluído.
+- Bundle novo retornou HTTP 200.
+- Interface autenticada renderizou lista e conversa após atualização.
+- Teste determinístico de merge preservou `M1 → M2 → M3` sem duplicação.
+- Serviço permaneceu ativo, com `NRestarts=0` e health 200 durante a observação.
