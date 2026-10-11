@@ -2247,6 +2247,7 @@ async function handleApi(request, response, url) {
   if (groupPhotoMatch && ["POST", "DELETE"].includes(request.method)) {
     let uploaded = null;
     let previousUrl = "";
+    let updated = null;
     try {
       if (request.method === "POST") {
         uploaded = await saveUploadedImage("groups", await readBody(request, 4 * 1024 * 1024), request.headers["content-type"]);

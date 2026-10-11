@@ -1,5 +1,11 @@
 # Histórico de alterações
 
+## 2026-10-11 — Correção do upload de foto de grupo
+
+- Declarada a variável `updated` na rota `POST/DELETE /api/internal/conversations/:id/group-photo`.
+- O erro ocorria no backend em modo estrito após o upload, impedindo a resposta com o resumo atualizado.
+- Nome, histórico, permissões, SSE e armazenamento das fotos foram preservados.
+
 ## 2026-09-21 — Estabilidade de conexões realtime
 
 - Investigado crash do Node causado por `JavaScript heap out of memory` e `EPIPE` não tratado durante broadcast de presença.

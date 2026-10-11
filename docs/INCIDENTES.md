@@ -1,5 +1,23 @@
 # Incidentes
 
+## 2026-10-11 — `updated is not defined` ao alterar foto de grupo
+
+### Sintoma
+
+Alterar o nome do grupo funcionava, mas adicionar ou substituir a foto retornava `ReferenceError: updated is not defined`.
+
+### Causa confirmada
+
+A rota `POST/DELETE /api/internal/conversations/:id/group-photo` atribuía `updated = conversation` sem declarar a variável no escopo da rota. Como o backend usa módulos ES em modo estrito, a atribuição gerava `ReferenceError` antes da resposta e da emissão do evento SSE.
+
+### Correção
+
+Declarado `let updated = null` no escopo da rota. O fluxo de upload, persistência do caminho, remoção da foto anterior, resumo e SSE foi mantido.
+
+### Validação
+
+Sintaxe, build, health local/público e assets foram validados. O teste autenticado de proprietário/administrador ainda depende de contas de teste autorizadas; não foram alterados grupos reais durante a correção.
+
 ## 2026-09-21 — Queda e desconexões do realtime
 
 ### Sintoma
