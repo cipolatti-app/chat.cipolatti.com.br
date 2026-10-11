@@ -48,3 +48,11 @@ Detalhes operacionais e evidências permanecem em `docs/INCIDENTES.md`.
 - A reconciliação de conversas preserva os históricos carregados localmente e continua usando a política de cache existente.
 - Não houve alteração no banco, na persistência, no SSE, no cursor de paginação ou na quantidade de mensagens por página.
 - Frontend: `2026.09.22.1`; Service Worker: `20260922-message-state-reconciliation-v1`.
+
+## 2026-10-11 — Reconciliação do código-fonte da produção
+
+- Confirmada a divergência entre o release-fonte em `/opt/kalion-connect/current` e o frontend já publicado em `/opt/kalion-connect/external-dist`.
+- Reconciliados somente `src/App.jsx` e `public/notification-sw.js` com `company/main` em `a1a23a2c986a90aec90b5074590cd0d2d4736feb`.
+- O `external-dist` não foi republicado nem alterado; o bundle `index-hl2YWpxX.js`, a versão frontend `2026.09.22.1` e o Service Worker `20260922-message-state-reconciliation-v1` permaneceram iguais.
+- Backup dos dois arquivos-fonte anteriores criado em `/var/backups/kalion-connect/20261011-1145-source-reconciliation`.
+- Não houve restart do `kalion-connect`, alteração de banco, uploads, NAS ou `.148`.
