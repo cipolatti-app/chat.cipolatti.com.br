@@ -23,6 +23,8 @@
   --purple: #8848e5;
 }
 
+.group-profile-modal{display:flex;flex-direction:column;gap:14px}.group-profile-photo-editor{display:flex;align-items:center;gap:14px;padding:12px;border:1px solid var(--line);border-radius:6px;background:var(--surface-soft)}.group-profile-photo-editor>div{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}.group-profile-photo-editor strong,.group-profile-photo-editor small{width:100%}.group-profile-photo-editor small,.group-profile-counter{color:var(--muted);font-size:9px}.group-profile-photo-editor label{position:relative;overflow:hidden}.group-profile-photo-editor input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--bg); overflow-x: hidden; }
 button, input, textarea, select { font: inherit; }

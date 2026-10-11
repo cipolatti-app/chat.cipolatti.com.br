@@ -1611,6 +1611,27 @@ async function handleApi(request, response, url) {
     });
   }
 
+  const groupPhotoReadMatch = url.pathname.match(/^\/api\/uploads\/groups\/([^/]+)$/);
+  if (groupPhotoReadMatch && request.method === "GET") {
+    try {
+      const data = await readStore();
+      const photoUrl = `/api/uploads/groups/${groupPhotoReadMatch[1]}`;
+      const conversation = (data.internalConversations || []).find((item) => item.type === "group" && String(item.imageUrl || "").split("?")[0] === photoUrl);
+      if (!conversation || !canAccessInternalConversation(request.auth, conversation)) {
+        return json(response, 403, { error: "Sem permissão para esta imagem." });
+      }
+      const image = await readUploadedImage("groups", groupPhotoReadMatch[1]);
+      response.writeHead(200, {
+        "Content-Type": image.mime,
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+      });
+      return response.end(image.buffer);
+    } catch {
+      return json(response, 404, { error: "Imagem do grupo não encontrada." });
+    }
+  }
+
   const uploadReadMatch = url.pathname.match(/^\/api\/uploads\/(company|users|contacts)\/([^/]+)$/);
   if (uploadReadMatch && request.method === "GET") {
     try {
@@ -2187,6 +2208,74 @@ async function handleApi(request, response, url) {
       pagination: { limit, hasMoreBefore: hasMore, before: nextCursor },
     });
   }
+
+  const groupProfileMatch = url.pathname.match(/^\/api\/internal\/conversations\/([^/]+)\/group-profile$/);
+  if (groupProfileMatch && ["PATCH", "POST"].includes(request.method)) {
+    let updated;
+    try {
+      const input = JSON.parse((await readBody(request, 32 * 1024)).toString("utf8") || "{}");
+      await updateStore((data) => {
+        const conversation = data.internalConversations.find((item) => item.id === groupProfileMatch[1]);
+        if (!conversation) throw notFoundError("Grupo não encontrado.");
+        ensureInternalShape(conversation);
+        if (conversation.type !== "group") throw permissionError("Somente grupos podem ter o perfil alterado.");
+        if (!canAccessInternalConversation(request.auth, conversation)) throw permissionError("Sem permissão para este grupo.");
+        if (!canManageInternalConversation(request.auth, conversation)) throw permissionError("Somente o proprietário ou administradores podem editar o grupo.");
+        const title = String(input.title ?? "").trim();
+        if (!title) throw new Error("Informe um nome para o grupo.");
+        if (title.length > 120) throw new Error("O nome do grupo deve ter no máximo 120 caracteres.");
+        if (title === String(conversation.title || "").trim()) {
+          updated = conversation;
+          return;
+        }
+        conversation.title = title;
+        conversation.updatedAt = new Date().toISOString();
+        conversation.events ||= [];
+        conversation.events.push(internalEvent("group_profile_updated", request.auth, `${request.auth.name} alterou o nome do grupo.`, { groupId: conversation.id, field: "title" }));
+        audit(data, request, "Nome do grupo atualizado", `${conversation.id}: ${title}`);
+        updated = conversation;
+      });
+      const data = await readStore();
+      broadcastInternalConversation(data, updated.id, request.auth.id, "group-profile", [], { backendPersistedAt: new Date().toISOString() });
+      return json(response, 200, internalConversationSummary(data, updated, request.auth));
+    } catch (error) {
+      return json(response, requestErrorStatus(error), { error: error.message });
+    }
+  }
+
+  const groupPhotoMatch = url.pathname.match(/^\/api\/internal\/conversations\/([^/]+)\/group-photo$/);
+  if (groupPhotoMatch && ["POST", "DELETE"].includes(request.method)) {
+    let uploaded = null;
+    let previousUrl = "";
+    try {
+      if (request.method === "POST") {
+        uploaded = await saveUploadedImage("groups", await readBody(request, 4 * 1024 * 1024), request.headers["content-type"]);
+      }
+      await updateStore((data) => {
+        const conversation = data.internalConversations.find((item) => item.id === groupPhotoMatch[1]);
+        if (!conversation) throw notFoundError("Grupo não encontrado.");
+        ensureInternalShape(conversation);
+        if (conversation.type !== "group") throw permissionError("Somente grupos podem ter foto.");
+        if (!canAccessInternalConversation(request.auth, conversation)) throw permissionError("Sem permissão para este grupo.");
+        if (!canManageInternalConversation(request.auth, conversation)) throw permissionError("Somente o proprietário ou administradores podem editar a foto do grupo.");
+        previousUrl = conversation.imageUrl || "";
+        conversation.imageUrl = uploaded?.url || "";
+        conversation.updatedAt = new Date().toISOString();
+        conversation.events ||= [];
+        conversation.events.push(internalEvent("group_profile_updated", request.auth, `${request.auth.name} ${uploaded ? "atualizou" : "removeu"} a foto do grupo.`, { groupId: conversation.id, field: "image" }));
+        audit(data, request, uploaded ? "Foto do grupo atualizada" : "Foto do grupo removida", conversation.id);
+        updated = conversation;
+      });
+      if (previousUrl && previousUrl !== uploaded?.url) await removeUploadedImage(previousUrl);
+      const data = await readStore();
+      broadcastInternalConversation(data, updated.id, request.auth.id, "group-profile", [], { backendPersistedAt: new Date().toISOString() });
+      return json(response, 200, internalConversationSummary(data, updated, request.auth));
+    } catch (error) {
+      if (uploaded?.url) await removeUploadedImage(uploaded.url).catch(() => {});
+      return json(response, requestErrorStatus(error), { error: error.message });
+    }
+  }
+
   const internalMatch = url.pathname.match(/^\/api\/internal\/conversations\/([^/]+)(?:\/(messages|audio|files|participants|send-policy|forward|close|read|react|edit))?$/);
   if (internalMatch && request.method === "GET" && !internalMatch[2]) {
     const data = await readStore();

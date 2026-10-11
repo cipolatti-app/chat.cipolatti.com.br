@@ -56,3 +56,12 @@ Detalhes operacionais e evidências permanecem em `docs/INCIDENTES.md`.
 - O `external-dist` não foi republicado nem alterado; o bundle `index-hl2YWpxX.js`, a versão frontend `2026.09.22.1` e o Service Worker `20260922-message-state-reconciliation-v1` permaneceram iguais.
 - Backup dos dois arquivos-fonte anteriores criado em `/var/backups/kalion-connect/20261011-1145-source-reconciliation`.
 - Não houve restart do `kalion-connect`, alteração de banco, uploads, NAS ou `.148`.
+
+## 2026-10-11 — Edição de nome e foto dos grupos
+
+- Proprietários e administradores passaram a poder alterar o nome e adicionar, substituir ou remover a foto de grupos.
+- O backend valida participação e papel em rotas protegidas de perfil e foto; participantes comuns continuam recebendo `403`, inclusive em chamadas diretas.
+- Fotos são armazenadas em `/var/lib/kalion-connect/uploads/groups`, fora do `database.json`, com nomes imprevisíveis e validação de JPEG, PNG/WebP e limite de 3 MB.
+- A pasta `uploads/` já coberta pela rotina de backup inclui as fotos de grupos.
+- Alterações persistidas emitem evento SSE de resumo, preservando mensagens, cursores e estado de leitura nos clientes conectados.
+- Frontend: `2026.10.11.1`; Service Worker: `20261011-group-profile-v1`.

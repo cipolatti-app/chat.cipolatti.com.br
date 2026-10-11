@@ -3,7 +3,7 @@ import path from "node:path";
 import { createId, dataDir } from "./store.mjs";
 
 const uploadsRoot = path.join(dataDir, "uploads");
-const uploadTypes = new Set(["company", "users", "contacts", "audio", "attachments"]);
+const uploadTypes = new Set(["company", "users", "contacts", "groups", "audio", "attachments"]);
 const maxImageBytes = 3 * 1024 * 1024;
 const maxAudioBytes = 8 * 1024 * 1024;
 export const maxAttachmentBytes = Number.parseInt(process.env.KALION_MAX_ATTACHMENT_BYTES || "", 10) || 10 * 1024 * 1024;
@@ -251,7 +251,7 @@ export async function readUploadedAttachment(storedName) {
 }
 
 export async function removeUploadedImage(url) {
-  const match = String(url || "").match(/^\/api\/uploads\/(company|users|contacts)\/([a-z0-9_-]+-\d+-[a-z0-9]+\.(?:jpg|png|webp))$/i);
+  const match = String(url || "").split("?")[0].match(/^\/api\/uploads\/(company|users|contacts|groups)\/([a-z0-9_-]+-\d+-[a-z0-9]+\.(?:jpg|png|webp))$/i);
   if (!match) return;
   const target = path.resolve(path.join(uploadsRoot, match[1], match[2]));
   const allowed = path.resolve(path.join(uploadsRoot, match[1]));

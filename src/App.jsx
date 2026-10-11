@@ -17,7 +17,7 @@ import { activity, chartData, contacts, departments, users } from "./data";
 const BRAND_NAME = "CIPOLATTI";
 const BRAND_SUBTITLE = "Central de Atendimento Corporativo";
 const BRAND_ICON = `${import.meta.env.BASE_URL}cipolatti-icon.png`;
-const FRONTEND_BUILD_VERSION = "2026.09.22.1";
+const FRONTEND_BUILD_VERSION = "2026.10.11.1";
 const DEFAULT_API_TIMEOUT_MS = 15000;
 const LOGIN_API_TIMEOUT_MS = 15000;
 const appLifecycle = { hiddenAt: 0, resumedAt: Date.now() };
@@ -3190,6 +3190,40 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       setToast(error.message || "Não foi possível alterar quem envia mensagens.");
     }
   };
+  const applyConversationSummary = (summary) => {
+    if (!summary?.id) return;
+    setConversations((items) => items.map((item) => item.id === summary.id
+      ? mapInternalConversation({ ...summary, messages: item.messages || [] }, currentUser)
+      : item));
+  };
+  const updateGroupProfile = async ({ title, photoFile, removePhoto }) => {
+    if (!internal || !current?.id || current.type !== "group" || !currentCanManageGroup) return;
+    let changed = false;
+    try {
+      if (String(title || "").trim() && String(title).trim() !== String(current.title || current.name || "").trim()) {
+        const summary = await apiRequest(`/api/internal/conversations/${current.id}/group-profile`, {
+          method: "PATCH",
+          body: JSON.stringify({ title: String(title).trim() }),
+        });
+        applyConversationSummary(summary);
+        changed = true;
+      }
+      if (photoFile) {
+        const summary = await uploadImage(`/api/internal/conversations/${current.id}/group-photo`, photoFile);
+        applyConversationSummary(summary);
+        changed = true;
+      } else if (removePhoto && current.photoUrl) {
+        const summary = await apiRequest(`/api/internal/conversations/${current.id}/group-photo`, { method: "DELETE", body: "{}" });
+        applyConversationSummary(summary);
+        changed = true;
+      }
+      setModal("");
+      setMoreMenuOpen(false);
+      setToast(changed ? "Dados do grupo atualizados." : "Nenhuma alteração foi feita.");
+    } catch (error) {
+      setToast(error.message || "Não foi possível atualizar o grupo.");
+    }
+  };
 
   const leaveGroup = async () => {
     if (!current?.id || current.type !== "group") return;
@@ -3362,8 +3396,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
     if (action === "message-policy") return setModal("message-policy");
     if (action === "shared-media") return setModal("shared-media");
     if (action === "mute") return setToast("Silenciar grupo será disponibilizado em uma próxima etapa.");
-    if (action === "edit") return setToast("Editar grupo será disponibilizado em uma próxima etapa.");
-    if (action === "image") return setToast("Alterar imagem será disponibilizado em uma próxima etapa.");
+    if (action === "edit" || action === "image") return setModal("group-profile");
     if (action === "leave") return leaveGroup();
     if (action === "end") return setModal("end");
   };
@@ -3551,7 +3584,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
             {!internal && <button className="secondary-button" onClick={() => setModal("transfer")}><ArrowLeftRight size={17} /> Transferir</button>}
             {internal && <button className="secondary-button" onClick={() => setModal("shared-media")}><Paperclip size={17} /> Midias</button>}
             {internal && current.type === "group" && currentCanManageGroup && <button className="secondary-button" onClick={() => setModal("participant")}><UserPlus size={17} /> Adicionar pessoa</button>}
-            {internal && current.type === "group" && <div className="chat-more"><button className="icon-button" aria-label="Mais opções" onClick={() => setMoreMenuOpen((value) => !value)}><MoreHorizontal size={19}/></button>{moreMenuOpen && <div className="chat-more-menu"><button onClick={() => handleMoreAction("edit")}>Editar grupo</button><button onClick={() => handleMoreAction("image")}>Alterar imagem</button><button onClick={() => handleMoreAction("participants")}>Ver participantes</button>{currentCanManageGroup && <button onClick={() => handleMoreAction("message-policy")}>Permitir mensagens</button>}<button onClick={() => handleMoreAction("shared-media")}>Midias compartilhadas</button><button onClick={() => handleMoreAction("mute")}>Silenciar grupo</button><button className="danger-option" disabled={current.ended} onClick={() => handleMoreAction("end")}>Encerrar grupo</button><button onClick={() => handleMoreAction("leave")}>Sair do grupo</button></div>}</div>}
+            {internal && current.type === "group" && <div className="chat-more"><button className="icon-button" aria-label="Mais opções" onClick={() => setMoreMenuOpen((value) => !value)}><MoreHorizontal size={19}/></button>{moreMenuOpen && <div className="chat-more-menu">{currentCanManageGroup && <><button onClick={() => handleMoreAction("edit")}>Editar grupo</button><button onClick={() => handleMoreAction("image")}>Alterar imagem</button></>}<button onClick={() => handleMoreAction("participants")}>Ver participantes</button>{currentCanManageGroup && <button onClick={() => handleMoreAction("message-policy")}>Permitir mensagens</button>}<button onClick={() => handleMoreAction("shared-media")}>Midias compartilhadas</button><button onClick={() => handleMoreAction("mute")}>Silenciar grupo</button><button className="danger-option" disabled={current.ended} onClick={() => handleMoreAction("end")}>Encerrar grupo</button><button onClick={() => handleMoreAction("leave")}>Sair do grupo</button></div>}</div>}
             {internal ? <button className="secondary-button" onClick={() => setConversationSearchOpen(true)}><Search size={17} /> Buscar na conversa</button> : <button className="danger-button" disabled={current.ended} onClick={() => setModal("end")}>{current.ended ? "Atendimento encerrado" : "Encerrar atendimento"}</button>}
           </div>
         </header>
@@ -3603,6 +3636,7 @@ function ChatPage({ internal = false, groupOnly = false, currentUser = users[0] 
       {modal === "transfer" && <TransferModal onClose={() => setModal("")} onConfirm={transfer} />}
       {modal === "participant" && <AddParticipantsModal conversation={current} directory={collaboratorsWithPresence} onClose={() => setModal("")} onConfirm={addParticipant} />}
       {modal === "participants" && <ParticipantsModal conversation={current} directory={collaboratorsWithPresence} currentUser={currentUser} onAction={changeParticipantRole} onClose={() => setModal("")} />}
+      {modal === "group-profile" && <GroupProfileModal conversation={current} onClose={() => setModal("")} onSave={updateGroupProfile} />}
       {modal === "message-policy" && <Modal title="Permitir mensagens" onClose={() => setModal("")} footer={<><button className="secondary-button" onClick={() => setModal("")}>Cancelar</button><button className="primary-button" onClick={() => changeGroupSendPolicy(current?.messageSendMode === "admins" ? "all" : "admins")}>{current?.messageSendMode === "admins" ? "Permitir todos" : "Somente administradores"}</button></>}><div className="group-send-policy"><p>Defina quem pode enviar texto, áudio, imagens, anexos, respostas e encaminhamentos neste grupo.</p><label className={current?.messageSendMode !== "admins" ? "selected" : ""}><input type="radio" name="group-send-policy" checked={current?.messageSendMode !== "admins"} onChange={() => changeGroupSendPolicy("all")} /><span><strong>Todos os participantes</strong><small>Todos continuam lendo e enviando normalmente.</small></span></label><label className={current?.messageSendMode === "admins" ? "selected" : ""}><input type="radio" name="group-send-policy" checked={current?.messageSendMode === "admins"} onChange={() => changeGroupSendPolicy("admins")} /><span><strong>Somente administradores</strong><small>Participantes comuns continuam lendo, mas não enviam mensagens.</small></span></label></div></Modal>}
       {modal === "shared-media" && <SharedMediaModal conversation={current} onClose={() => setModal("")} onOpenMessage={openMessageInConversation} />}
       {modal === "contact" && <TextModal title="Editar contato" label="Nome do contato" initialValue={current.name} onClose={() => setModal("")} onConfirm={(value) => { updateCurrent((conversation) => ({ ...conversation, name: value })); setModal(""); }} />}
@@ -3871,6 +3905,47 @@ function NewConversationModal({ collaborators = [], currentUser, onClose, onConf
         </table>
       </div>
       {!visibleCollaborators.length && <div className="empty-result">Nenhum colaborador ativo encontrado.</div>}
+    </div>
+  </Modal>;
+}
+
+function GroupProfileModal({ conversation, onClose, onSave }) {
+  const [title, setTitle] = useState(conversation.title || conversation.name || "");
+  const [photoFile, setPhotoFile] = useState(null);
+  const [removePhoto, setRemovePhoto] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState(conversation.photoUrl || "");
+  const validTitle = title.trim().length > 0 && title.trim().length <= 120;
+  useEffect(() => {
+    if (!photoFile) return undefined;
+    const url = URL.createObjectURL(photoFile);
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [photoFile]);
+  const selectPhoto = (file) => {
+    if (!file) return;
+    if (!/^image\/(jpeg|png|webp)$/i.test(file.type)) return window.alert("Selecione uma imagem JPG, PNG ou WebP.");
+    if (file.size > 3 * 1024 * 1024) return window.alert("A foto deve ter no máximo 3 MB.");
+    setPhotoFile(file);
+    setRemovePhoto(false);
+  };
+  const save = async () => {
+    if (!validTitle || saving) return;
+    setSaving(true);
+    try {
+      await onSave({ title: title.trim(), photoFile, removePhoto });
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <Modal title="Editar grupo" className="group-profile-modal-shell" onClose={onClose} footer={<><button type="button" className="secondary-button" disabled={saving} onClick={onClose}>Cancelar</button><button type="button" className="primary-button" disabled={!validTitle || saving} onClick={save}><Save size={16}/> {saving ? "Salvando..." : "Salvar"}</button></>}>
+    <div className="group-profile-modal">
+      <div className="group-profile-photo-editor">
+        <Avatar initials={(title || "Grupo").split(" ").map((item) => item[0]).slice(0, 2).join("").toUpperCase()} color={conversation.color} src={previewUrl} alt={title} size="lg" />
+        <div><strong>Foto do grupo</strong><small>JPG, PNG ou WebP, até 3 MB.</small><label className="secondary-button"><Image size={15}/> {photoFile ? "Trocar foto" : "Selecionar foto"}<input type="file" accept="image/jpeg,image/png,image/webp" disabled={saving} onChange={(event) => { selectPhoto(event.target.files?.[0]); event.target.value = ""; }} /></label>{(previewUrl || conversation.photoUrl) && <button type="button" className="secondary-button" disabled={saving} onClick={() => { setPhotoFile(null); setPreviewUrl(""); setRemovePhoto(true); }}>Remover foto</button>}</div>
+      </div>
+      <label className="modal-field"><span>Nome do grupo</span><input maxLength={120} value={title} disabled={saving} onChange={(event) => setTitle(event.target.value)} autoFocus /></label>
+      <small className="group-profile-counter">{title.trim().length}/120 caracteres</small>
     </div>
   </Modal>;
 }
